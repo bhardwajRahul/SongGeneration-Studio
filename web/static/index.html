@@ -736,16 +736,43 @@ const App = () => {
     const [genStartTime, setGenStartTime] = useState(null);
     const [estimatedTime, setEstimatedTime] = useState(null);
     const [elapsedTime, setElapsedTime] = useState(0);
+    const [gpuInfo, setGpuInfo] = useState(null);
     const pollRef = useRef(null);
     const fileRef = useRef(null);
     const addBtnRef = useRef(null);
     const timerRef = useRef(null);
 
-    useEffect(() => { loadModels(); loadLibrary(); }, []);
+    useEffect(() => { loadModels(); loadLibrary(); loadGpuInfo(); }, []);
     useEffect(() => () => {
         pollRef.current && clearInterval(pollRef.current);
         timerRef.current && clearInterval(timerRef.current);
     }, []);
+
+    // Auto-set output mode based on lyrics presence
+    useEffect(() => {
+        const hasLyrics = sections.some(s => s.lyrics && s.lyrics.trim().length > 0);
+        if (hasLyrics && outputMode === 'bgm') {
+            setOutputMode('mixed');
+        } else if (!hasLyrics && outputMode === 'mixed') {
+            setOutputMode('bgm');
+        }
+    }, [sections]);
+
+    // Auto-select best model based on available VRAM
+    useEffect(() => {
+        if (!gpuInfo?.gpu?.total_gb || models.length === 0) return;
+        const vram = gpuInfo.gpu.total_gb;
+        // Model VRAM requirements: large=22GB, base_full=12GB, base/base_new=10GB
+        let bestModel = 'songgeneration_base';
+        if (vram >= 22 && models.some(m => m.id === 'songgeneration_large')) {
+            bestModel = 'songgeneration_large';
+        } else if (vram >= 12 && models.some(m => m.id === 'songgeneration_base_full')) {
+            bestModel = 'songgeneration_base_full';
+        } else if (models.some(m => m.id === 'songgeneration_base_new')) {
+            bestModel = 'songgeneration_base_new';
+        }
+        setSelectedModel(bestModel);
+    }, [gpuInfo, models]);
 
     // Time estimation based on model and lyrics
     const estimateGenerationTime = useCallback((model, sectionsList) => {
@@ -812,6 +839,16 @@ const App = () => {
                 const d = await r.json();
                 setModels(d.models || []);
                 if (d.default) setSelectedModel(d.default);
+            }
+        } catch (e) { console.error(e); }
+    };
+
+    const loadGpuInfo = async () => {
+        try {
+            const r = await fetch('/api/gpu');
+            if (r.ok) {
+                const d = await r.json();
+                setGpuInfo(d);
             }
         } catch (e) { console.error(e); }
     };
@@ -1092,12 +1129,32 @@ const App = () => {
                         {/* Memory Mode */}
                         <Card>
                             <CardTitle>Memory Mode</CardTitle>
+                            {gpuInfo && gpuInfo.gpu && (
+                                <div style={{ fontSize: '11px', color: '#888', marginBottom: '10px' }}>
+                                    {gpuInfo.gpu.name} • {gpuInfo.gpu.free_gb}GB free / {gpuInfo.gpu.total_gb}GB total
+                                </div>
+                            )}
                             <div style={{ display: 'flex', gap: '8px' }}>
-                                {['auto', 'low', 'high'].map(mode => (
-                                    <button key={mode} onClick={() => setMemoryMode(mode)} style={btnStyle(memoryMode === mode)}>
-                                        {mode.charAt(0).toUpperCase() + mode.slice(1)}
-                                    </button>
-                                ))}
+                                {['auto', 'low', 'high'].map(mode => {
+                                    const needsHighVram = mode === 'high';
+                                    const hasEnoughVram = gpuInfo?.gpu?.total_gb >= 12;
+                                    const isDisabled = needsHighVram && !hasEnoughVram;
+                                    return (
+                                        <button
+                                            key={mode}
+                                            onClick={() => !isDisabled && setMemoryMode(mode)}
+                                            disabled={isDisabled}
+                                            title={isDisabled ? 'Requires 12GB+ VRAM' : ''}
+                                            style={{
+                                                ...btnStyle(memoryMode === mode),
+                                                opacity: isDisabled ? 0.4 : 1,
+                                                cursor: isDisabled ? 'not-allowed' : 'pointer',
+                                            }}
+                                        >
+                                            {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                                        </button>
+                                    );
+                                })}
                             </div>
                         </Card>
 
