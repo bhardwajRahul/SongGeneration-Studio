@@ -306,6 +306,7 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
     const fileInputRef = useRef(null);
     const audioContextRef = useRef(null);
     const audioBufferRef = useRef(null);
+    const playIntervalRef = useRef(null);
 
     const formatTime = (seconds) => {
         if (!seconds || isNaN(seconds)) return '0:00';
@@ -330,7 +331,7 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
         const ws = WaveSurfer.create({
             container: waveformRef.current,
             waveColor: '#4a4a4a',
-            progressColor: '#10B981',
+            progressColor: '#4a4a4a',  // Same as waveColor - we use overlay for selection
             cursorColor: '#10B981',
             cursorWidth: 2,
             height: 80,
@@ -347,7 +348,7 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
         const url = URL.createObjectURL(file);
         ws.load(url);
 
-        ws.on('ready', () => {
+        ws.on('ready', async () => {
             setIsLoading(false);
             const duration = ws.getDuration();
             setTotalDuration(duration);
@@ -357,9 +358,21 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
             setClipDuration(initialClipDuration);
             setRegionStart(0);
 
-            // Store the decoded audio buffer for trimming
-            if (ws.getDecodedData()) {
-                audioBufferRef.current = ws.getDecodedData();
+            // Decode audio directly from file for full quality (don't use WaveSurfer's decoded data)
+            try {
+                if (!audioContextRef.current) {
+                    audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                const arrayBuffer = await file.arrayBuffer();
+                const decodedBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
+                audioBufferRef.current = decodedBuffer;
+                console.log(`Audio decoded: ${decodedBuffer.sampleRate}Hz, ${decodedBuffer.numberOfChannels}ch, ${decodedBuffer.length} samples`);
+            } catch (err) {
+                console.error('Failed to decode audio:', err);
+                // Fallback to WaveSurfer's decoded data
+                if (ws.getDecodedData()) {
+                    audioBufferRef.current = ws.getDecodedData();
+                }
             }
         });
 
@@ -399,39 +412,53 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
         setRegionStart(0);
     };
 
-    // Preview selected region
+    // Stop playback helper
+    const stopPlayback = () => {
+        if (playIntervalRef.current) {
+            clearInterval(playIntervalRef.current);
+            playIntervalRef.current = null;
+        }
+        if (wavesurferRef.current) {
+            wavesurferRef.current.pause();
+        }
+        setIsPlaying(false);
+    };
+
+    // Preview selected region only
     const handlePreview = () => {
         if (!wavesurferRef.current) return;
 
         if (isPlaying) {
-            wavesurferRef.current.pause();
-            setIsPlaying(false);
+            stopPlayback();
         } else {
+            // Clear any existing interval
+            if (playIntervalRef.current) {
+                clearInterval(playIntervalRef.current);
+            }
+
             // Seek to region start and play
             wavesurferRef.current.setTime(regionStart);
             wavesurferRef.current.play();
             setIsPlaying(true);
 
             // Stop at region end
-            const checkTime = setInterval(() => {
+            playIntervalRef.current = setInterval(() => {
                 if (wavesurferRef.current) {
                     const currentTime = wavesurferRef.current.getCurrentTime();
-                    if (currentTime >= regionStart + clipDuration) {
-                        wavesurferRef.current.pause();
-                        setIsPlaying(false);
-                        clearInterval(checkTime);
+                    if (currentTime >= regionStart + clipDuration || !wavesurferRef.current.isPlaying()) {
+                        stopPlayback();
                     }
                 }
-            }, 100);
+            }, 50);
         }
     };
 
-    // Audio buffer to WAV conversion
+    // Audio buffer to WAV conversion - 32-bit float for best quality
     const audioBufferToWav = (buffer) => {
         const numChannels = buffer.numberOfChannels;
         const sampleRate = buffer.sampleRate;
-        const format = 1; // PCM
-        const bitDepth = 16;
+        const format = 3; // IEEE float
+        const bitDepth = 32;
 
         const bytesPerSample = bitDepth / 8;
         const blockAlign = numChannels * bytesPerSample;
@@ -455,7 +482,7 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
         writeString(8, 'WAVE');
         writeString(12, 'fmt ');
         view.setUint32(16, 16, true); // fmt chunk size
-        view.setUint16(20, format, true);
+        view.setUint16(20, format, true); // 3 = IEEE float
         view.setUint16(22, numChannels, true);
         view.setUint32(24, sampleRate, true);
         view.setUint32(28, byteRate, true);
@@ -464,7 +491,7 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
         writeString(36, 'data');
         view.setUint32(40, dataSize, true);
 
-        // Write interleaved audio data
+        // Write interleaved audio data as 32-bit float (no conversion loss)
         const channels = [];
         for (let ch = 0; ch < numChannels; ch++) {
             channels.push(buffer.getChannelData(ch));
@@ -473,10 +500,8 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
         let offset = 44;
         for (let i = 0; i < buffer.length; i++) {
             for (let ch = 0; ch < numChannels; ch++) {
-                const sample = Math.max(-1, Math.min(1, channels[ch][i]));
-                const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-                view.setInt16(offset, intSample, true);
-                offset += 2;
+                view.setFloat32(offset, channels[ch][i], true);
+                offset += 4;
             }
         }
 
@@ -485,6 +510,9 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
 
     // Trim and accept
     const handleAccept = async () => {
+        // Stop playback first
+        stopPlayback();
+
         if (!audioBufferRef.current) {
             setError('Audio not loaded yet');
             return;
@@ -713,8 +741,22 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
                 </div>
             </div>
 
-            {/* Waveform container */}
-            <div className="waveform-container" style={{ position: 'relative' }}>
+            {/* Waveform container - click to move selection */}
+            <div
+                className="waveform-container"
+                style={{ position: 'relative', overflow: 'hidden', cursor: totalDuration > 0 ? 'pointer' : 'default' }}
+                onClick={(e) => {
+                    if (totalDuration <= 0 || isLoading) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const clickX = e.clientX - rect.left - 12; // Account for padding
+                    const containerWidth = rect.width - 24; // Account for padding
+                    const clickPercent = Math.max(0, Math.min(1, clickX / containerWidth));
+                    const clickTime = clickPercent * totalDuration;
+                    // Center the selection on click point
+                    const newStart = Math.max(0, Math.min(totalDuration - clipDuration, clickTime - clipDuration / 2));
+                    setRegionStart(newStart);
+                }}
+            >
                 {isLoading && (
                     <div style={{
                         position: 'absolute',
@@ -729,45 +771,38 @@ const AudioTrimmer = ({ onAccept, onClear }) => {
                         <span style={{ color: '#10B981', fontSize: '13px' }}>Loading...</span>
                     </div>
                 )}
-                <div ref={waveformRef} />
 
-                {/* Region overlay visualization */}
-                {totalDuration > 0 && (
-                    <div style={{
-                        position: 'absolute',
-                        top: '12px',
-                        left: `calc(12px + ${(regionStart / totalDuration) * 100}%)`,
-                        width: `${(clipDuration / totalDuration) * 100}%`,
-                        height: '80px',
-                        backgroundColor: 'rgba(16, 185, 129, 0.15)',
-                        border: '2px solid #10B981',
-                        borderRadius: '4px',
-                        pointerEvents: 'none',
-                        maxWidth: 'calc(100% - 24px)',
-                    }} />
-                )}
+                {/* Waveform wrapper with selection overlay */}
+                <div style={{ position: 'relative' }}>
+                    <div ref={waveformRef} />
+
+                    {/* Region overlay visualization - positioned over the waveform */}
+                    {totalDuration > 0 && !isLoading && (
+                        <div style={{
+                            position: 'absolute',
+                            top: 0,
+                            left: `${(regionStart / totalDuration) * 100}%`,
+                            width: `${(clipDuration / totalDuration) * 100}%`,
+                            height: '100%',
+                            backgroundColor: 'rgba(16, 185, 129, 0.25)',
+                            borderLeft: '2px solid #10B981',
+                            borderRight: '2px solid #10B981',
+                            pointerEvents: 'none',
+                            boxSizing: 'border-box',
+                        }} />
+                    )}
+                </div>
             </div>
 
-            {/* Region slider */}
+            {/* Selection info */}
             {totalDuration > 0 && (
-                <div style={{ marginTop: '12px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-                        <span style={{ fontSize: '11px', color: '#888' }}>
-                            Selection: {formatTime(regionStart)} - {formatTime(regionStart + clipDuration)}
-                        </span>
-                        <span style={{ fontSize: '11px', color: '#666' }}>
-                            Total: {formatTime(totalDuration)}
-                        </span>
-                    </div>
-                    <input
-                        type="range"
-                        min="0"
-                        max={Math.max(0, totalDuration - clipDuration)}
-                        step="0.1"
-                        value={regionStart}
-                        onChange={e => handleRegionSlide(parseFloat(e.target.value))}
-                        style={{ width: '100%' }}
-                    />
+                <div style={{ marginTop: '8px', display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ fontSize: '11px', color: '#888' }}>
+                        Selection: {formatTime(regionStart)} - {formatTime(regionStart + clipDuration)}
+                    </span>
+                    <span style={{ fontSize: '11px', color: '#666' }}>
+                        Total: {formatTime(totalDuration)}
+                    </span>
                 </div>
             )}
 
