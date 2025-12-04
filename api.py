@@ -148,16 +148,23 @@ class SongRequest(BaseModel):
     title: str = "Untitled"
     sections: List[Section]
     gender: str = "female"
-    timbre: str = "bright"
-    genre: str = "pop"
-    emotion: str = "happy"
-    instruments: str = "piano and drums"
+    timbre: str = ""
+    genre: str = ""
+    emotion: str = ""
+    instruments: str = ""
+    custom_style: Optional[str] = None  # Additional free-text style descriptors
     bpm: int = 120
     output_mode: str = "mixed"
     auto_prompt_type: Optional[str] = None
     reference_audio_id: Optional[str] = None
     model: str = "songgeneration_base"
     memory_mode: str = "auto"
+    # Advanced generation parameters
+    cfg_coef: float = 1.5          # Classifier-free guidance (0.1-3.0)
+    temperature: float = 0.8       # Sampling randomness (0.1-2.0)
+    top_k: int = 50                # Top-K sampling (1-250)
+    top_p: float = 0.0             # Nucleus sampling, 0 = disabled (0.0-1.0)
+    extend_stride: int = 5         # Extension stride for longer songs
 
 # ============================================================================
 # State
@@ -287,6 +294,10 @@ def build_description(request: SongRequest) -> str:
     if request.instruments:
         parts.append(request.instruments)
 
+    # Add custom style descriptors if provided
+    if request.custom_style:
+        parts.append(request.custom_style)
+
     if request.bpm:
         parts.append(f"the bpm is {request.bpm}")
 
@@ -380,13 +391,23 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         generations[gen_id]["memory_mode"] = memory_mode
         print(f"[GEN {gen_id}] Memory mode: {memory_mode}")
 
-        # Output mode flags
-        if request.output_mode == "vocal":
-            cmd.append("--vocal")
-        elif request.output_mode == "bgm":
-            cmd.append("--bgm")
-        elif request.output_mode == "separate":
-            cmd.append("--separate")
+        if memory_mode == "low":
+            cmd.append("--low_mem")
+
+        # Advanced generation parameters - pass via environment variables
+        adv_params = {
+            "SONGGEN_CFG_COEF": str(request.cfg_coef),
+            "SONGGEN_TEMPERATURE": str(request.temperature),
+            "SONGGEN_TOP_K": str(request.top_k),
+            "SONGGEN_TOP_P": str(request.top_p),
+            "SONGGEN_EXTEND_STRIDE": str(request.extend_stride),
+        }
+
+        print(f"[GEN {gen_id}] Advanced params: cfg={request.cfg_coef}, temp={request.temperature}, top_k={request.top_k}, top_p={request.top_p}")
+
+        # Output mode - use --generate_type argument
+        if request.output_mode and request.output_mode != "mixed":
+            cmd.extend(["--generate_type", request.output_mode])
 
         print(f"[GEN {gen_id}] Command: {' '.join(cmd)}")
 
@@ -398,6 +419,8 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{BASE_DIR};{flow_vae_dir};{env.get('PYTHONPATH', '')}"
         env["PYTHONUTF8"] = "1"
+        # Add advanced params to environment
+        env.update(adv_params)
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -492,6 +515,7 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
                 "genre": request.genre,
                 "emotion": request.emotion,
                 "instruments": request.instruments,
+                "custom_style": request.custom_style,
                 "bpm": request.bpm,
                 "output_mode": request.output_mode,
                 "memory_mode": request.memory_mode,
@@ -499,6 +523,12 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
                 "description": description,
                 "reference_audio": reference_path if reference_path else None,
                 "audio_files": [f.name for f in output_files],
+                # Advanced parameters
+                "cfg_coef": request.cfg_coef,
+                "temperature": request.temperature,
+                "top_k": request.top_k,
+                "top_p": request.top_p,
+                "extend_stride": request.extend_stride,
             }
             with open(metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -594,7 +624,7 @@ async def generate_song(request: SongRequest, background_tasks: BackgroundTasks)
     print(f"[API] Title: {request.title}")
     print(f"[API] Model: {request.model}")
     print(f"[API] Sections: {len(request.sections)}")
-    print(f"[API] Style: {request.genre}, {request.emotion}, {request.gender}")
+    print(f"[API] Style: {request.genre}, {request.emotion}, {request.timbre}, Voice: {request.gender}")
 
     reference_path = None
     if request.reference_audio_id:
@@ -626,9 +656,55 @@ async def get_generation_status(gen_id: str):
         raise HTTPException(404, "Generation not found")
     return generations[gen_id]
 
+def convert_audio(input_path: Path, output_format: str) -> Path:
+    """Convert audio file to the specified format using ffmpeg."""
+    import subprocess
+    import tempfile
+
+    output_format = output_format.lower().lstrip('.')
+    if output_format not in ('mp3', 'flac', 'wav'):
+        raise ValueError(f"Unsupported format: {output_format}")
+
+    # Create output path in temp directory
+    temp_dir = Path(tempfile.gettempdir()) / "songgen_conversions"
+    temp_dir.mkdir(exist_ok=True)
+
+    # Use hash of input path + format for caching
+    cache_key = f"{input_path.stem}_{hash(str(input_path))}_{output_format}"
+    output_path = temp_dir / f"{cache_key}.{output_format}"
+
+    # Return cached file if exists
+    if output_path.exists():
+        return output_path
+
+    # Convert using ffmpeg
+    cmd = ['ffmpeg', '-y', '-i', str(input_path)]
+
+    if output_format == 'mp3':
+        cmd.extend(['-codec:a', 'libmp3lame', '-qscale:a', '2'])  # High quality MP3
+    elif output_format == 'flac':
+        cmd.extend(['-codec:a', 'flac', '-compression_level', '8'])
+    elif output_format == 'wav':
+        cmd.extend(['-codec:a', 'pcm_s16le'])
+
+    cmd.append(str(output_path))
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg conversion failed: {result.stderr}")
+
+    return output_path
+
+
 @app.get("/api/audio/{gen_id}/{track_idx}")
-async def get_audio_track(gen_id: str, track_idx: int):
-    """Stream a specific track from a generation."""
+async def get_audio_track(gen_id: str, track_idx: int, format: Optional[str] = None):
+    """Stream a specific track from a generation.
+
+    Args:
+        gen_id: Generation ID
+        track_idx: Track index (0-based)
+        format: Optional output format (mp3, flac, wav). If not specified, returns original format.
+    """
     if gen_id not in generations:
         raise HTTPException(404, "Generation not found")
 
@@ -644,8 +720,23 @@ async def get_audio_track(gen_id: str, track_idx: int):
     if not output_path.exists():
         raise HTTPException(404, "Audio file not found")
 
-    ext = output_path.suffix.lower()
     media_types = {".wav": "audio/wav", ".flac": "audio/flac", ".mp3": "audio/mpeg"}
+
+    # Convert format if requested and different from source
+    if format:
+        format = format.lower().lstrip('.')
+        source_ext = output_path.suffix.lower().lstrip('.')
+
+        if format not in ('mp3', 'flac', 'wav'):
+            raise HTTPException(400, f"Unsupported format: {format}. Use mp3, flac, or wav.")
+
+        if format != source_ext:
+            try:
+                output_path = convert_audio(output_path, format)
+            except Exception as e:
+                raise HTTPException(500, f"Audio conversion failed: {str(e)}")
+
+    ext = output_path.suffix.lower()
 
     return FileResponse(
         output_path,
