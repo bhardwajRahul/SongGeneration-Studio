@@ -84,6 +84,12 @@
             background-color: #3a3a3a;
         }
 
+        /* Pulse animation for generating indicator */
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.8); }
+        }
+
         /* Indeterminate progress bar animation */
         @keyframes indeterminate {
             0% {
@@ -1474,7 +1480,7 @@ const SectionCard = ({ section, onUpdate, onRemove }) => {
     );
 };
 
-const LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQueue, onStop, onDelete, status, elapsedTime, estimatedTime }) => {
+const LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQueue, onStop, onDelete, onPlay, isCurrentlyPlaying, isAudioPlaying, status, elapsedTime, estimatedTime }) => {
     const [expanded, setExpanded] = useState(false);
     const meta = (isQueued || isGenerating) ? item : (item.metadata || {});
 
@@ -1614,10 +1620,49 @@ const LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFrom
                 </div>
             </div>
 
-            {/* Audio players */}
-            {!isQueued && !isGenerating && item.status === 'completed' && item.output_files?.map((f, i) => (
-                <DarkAudioPlayer key={i} src={`/api/audio/${item.id}/${i}`} />
-            ))}
+            {/* Play button - uses bottom player */}
+            {!isQueued && !isGenerating && item.status === 'completed' && (item.output_files?.length > 0 || item.output_file) && (
+                <button
+                    onClick={() => onPlay && onPlay(item)}
+                    style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '12px',
+                        padding: '12px 16px',
+                        backgroundColor: isCurrentlyPlaying ? '#10B98115' : '#1a1a1a',
+                        border: `1px solid ${isCurrentlyPlaying ? '#10B981' : '#333'}`,
+                        borderRadius: '8px',
+                        cursor: 'pointer',
+                        width: '100%',
+                        transition: 'all 0.15s',
+                    }}
+                >
+                    <div style={{
+                        width: '36px',
+                        height: '36px',
+                        borderRadius: '50%',
+                        backgroundColor: isCurrentlyPlaying ? '#10B981' : '#333',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        flexShrink: 0,
+                    }}>
+                        {isCurrentlyPlaying && isAudioPlaying ? (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="#fff">
+                                <rect x="6" y="4" width="4" height="16"/>
+                                <rect x="14" y="4" width="4" height="16"/>
+                            </svg>
+                        ) : (
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="#fff" style={{ marginLeft: '2px' }}>
+                                <path d="M8 5v14l11-7z"/>
+                            </svg>
+                        )}
+                    </div>
+                    <span style={{ color: isCurrentlyPlaying ? '#10B981' : '#888', fontSize: '13px' }}>
+                        {isCurrentlyPlaying && isAudioPlaying ? 'Now Playing' : 'Play'}
+                    </span>
+                </button>
+            )}
 
             {/* Expanded details */}
             {expanded && (
@@ -1726,6 +1771,15 @@ const App = () => {
     const addBtnRef = useRef(null);
     const timerRef = useRef(null);
 
+    // Activity panel audio / Media player
+    const [activityPlayingId, setActivityPlayingId] = useState(null);
+    const [activityPlayingItem, setActivityPlayingItem] = useState(null);
+    const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+    const [audioProgress, setAudioProgress] = useState(0);
+    const [audioDuration, setAudioDuration] = useState(0);
+    const [audioVolume, setAudioVolume] = useState(1);
+    const activityAudioRef = useRef(null);
+
     useEffect(() => { loadModels(); loadLibrary(); loadGpuInfo(); }, []);
     useEffect(() => () => {
         pollRef.current && clearInterval(pollRef.current);
@@ -1795,6 +1849,13 @@ const App = () => {
         return baseTime + lyricsTimeAdjust + sectionsAdjust + durationAdjust;
     }, []);
 
+    const formatTime = (seconds) => {
+        if (!seconds || isNaN(seconds)) return '0:00';
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    };
+
     const formatTimeRemaining = (seconds) => {
         if (seconds <= 0) return 'finishing...';
         const mins = Math.floor(seconds / 60);
@@ -1854,6 +1915,93 @@ const App = () => {
                 setLibrary(prev => prev.filter(item => item.id !== genId));
             }
         } catch (e) { console.error(e); }
+    };
+
+    const playActivityAudio = (item) => {
+        if (!item.output_file && (!item.output_files || item.output_files.length === 0)) return;
+        if (activityPlayingId === item.id && activityAudioRef.current) {
+            // Toggle pause/play on same track
+            if (activityAudioRef.current.paused) {
+                activityAudioRef.current.play().then(() => {
+                    setIsAudioPlaying(true);
+                }).catch(e => console.error('Resume error:', e));
+            } else {
+                activityAudioRef.current.pause();
+                setIsAudioPlaying(false);
+            }
+            return;
+        }
+        // Stop and clean up previous audio
+        if (activityAudioRef.current) {
+            activityAudioRef.current.pause();
+            activityAudioRef.current.src = '';
+            activityAudioRef.current = null;
+        }
+
+        // Set state immediately so UI updates
+        setActivityPlayingId(item.id);
+        setActivityPlayingItem(item);
+        setAudioProgress(0);
+        setAudioDuration(0);
+        setIsAudioPlaying(true); // Optimistically set to playing
+
+        // Play new track
+        const audio = new Audio();
+        audio.preload = 'auto';
+        audio.volume = audioVolume;
+        // Don't use onplay/onpause - they fire unexpectedly during buffering
+        audio.onended = () => {
+            setIsAudioPlaying(false);
+            setAudioProgress(0);
+            // Auto-play next song
+            playNextSong();
+        };
+        audio.onerror = (e) => {
+            console.error('Audio error:', e);
+            setIsAudioPlaying(false);
+        };
+        audio.ontimeupdate = () => setAudioProgress(audio.currentTime);
+        audio.onloadedmetadata = () => setAudioDuration(audio.duration);
+        audio.src = `/api/audio/${item.id}/0`;
+        activityAudioRef.current = audio;
+        audio.play().then(() => {
+            setIsAudioPlaying(true);
+        }).catch((e) => {
+            console.error('Play error:', e);
+            setIsAudioPlaying(false);
+        });
+    };
+
+    const seekAudio = (time) => {
+        if (activityAudioRef.current) {
+            activityAudioRef.current.currentTime = time;
+            setAudioProgress(time);
+        }
+    };
+
+    const setVolume = (vol) => {
+        setAudioVolume(vol);
+        if (activityAudioRef.current) {
+            activityAudioRef.current.volume = vol;
+        }
+    };
+
+    const playNextSong = () => {
+        if (!activityPlayingItem) return;
+        const completedSongs = library.filter(l => l.status === 'completed' && (l.output_file || (l.output_files && l.output_files.length > 0)));
+        const currentIndex = completedSongs.findIndex(l => l.id === activityPlayingItem.id);
+        if (currentIndex < completedSongs.length - 1) {
+            playActivityAudio(completedSongs[currentIndex + 1]);
+        }
+    };
+
+    const playPrevSong = () => {
+        if (!activityPlayingItem) return;
+        const completedSongs = library.filter(l => l.status === 'completed' && (l.output_file || (l.output_files && l.output_files.length > 0)));
+        const currentIndex = completedSongs.findIndex(l => l.id === activityPlayingItem.id);
+        if (currentIndex > 0) {
+            playActivityAudio(completedSongs[currentIndex - 1]);
+        }
     };
 
     const poll = useCallback(async (id) => {
@@ -2036,18 +2184,36 @@ const App = () => {
     const removeSection = (id) => setSections(sections.filter(s => s.id !== id));
     const updateSection = (id, updates) => setSections(sections.map(s => s.id === id ? { ...s, ...updates } : s));
 
-    const handleDragStart = (e, id) => { e.dataTransfer.setData('text/plain', id); e.dataTransfer.effectAllowed = 'move'; };
-    const handleDragOver = (e) => { e.preventDefault(); };
+    const [dragId, setDragId] = useState(null);
+    const [dragOverId, setDragOverId] = useState(null);
+
+    const handleDragStart = (e, id) => {
+        e.dataTransfer.setData('text/plain', id);
+        e.dataTransfer.effectAllowed = 'move';
+        setDragId(id);
+    };
+    const handleDragOver = (e, targetId) => {
+        e.preventDefault();
+        if (targetId !== dragOverId) setDragOverId(targetId);
+    };
+    const handleDragEnd = () => {
+        setDragId(null);
+        setDragOverId(null);
+    };
     const handleDrop = (e, targetId) => {
         e.preventDefault();
-        const dragId = e.dataTransfer.getData('text/plain');
-        if (dragId === targetId) return;
-        const dragIndex = sections.findIndex(s => s.id === dragId);
+        const draggedId = e.dataTransfer.getData('text/plain');
+        if (draggedId === targetId) {
+            handleDragEnd();
+            return;
+        }
+        const dragIndex = sections.findIndex(s => s.id === draggedId);
         const targetIndex = sections.findIndex(s => s.id === targetId);
         const newSections = [...sections];
         const [removed] = newSections.splice(dragIndex, 1);
         newSections.splice(targetIndex, 0, removed);
         setSections(newSections);
+        handleDragEnd();
     };
 
     const btnStyle = (isActive, activeColor = '#10B981') => ({
@@ -2143,7 +2309,7 @@ const App = () => {
                 overflowX: 'hidden',
             }}>
                 {/* Create View */}
-                <div style={{ display: activeTab === 'create' ? 'block' : 'none', paddingBottom: '80px' }}>
+                <div style={{ display: activeTab === 'create' ? 'block' : 'none', paddingBottom: '100px' }}>
                     <div style={{ display: 'flex', gap: '24px', maxWidth: '1400px', margin: '0 auto', padding: '0 24px 24px 24px' }}>
                     {/* Sidebar */}
                     <aside style={{ width: '320px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -2417,28 +2583,75 @@ const App = () => {
                                 }}
                             />
                         </Card>
+
+                        {/* Generate Button */}
+                        <button
+                            onClick={generate}
+                            disabled={generating && queue.length >= 10}
+                            style={{
+                                width: '100%',
+                                backgroundColor: generating ? '#6366F1' : '#10B981',
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: '12px',
+                                padding: '16px 24px',
+                                fontSize: '15px',
+                                fontWeight: '600',
+                                cursor: generating && queue.length >= 10 ? 'not-allowed' : 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                gap: '8px',
+                                opacity: generating && queue.length >= 10 ? 0.5 : 1,
+                                transition: 'all 0.15s',
+                            }}
+                        >
+                            {generating ? (
+                                <>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                        <path d="M12 5v14M5 12h14"/>
+                                    </svg>
+                                    Add to Queue {queue.length > 0 && `(${queue.length})`}
+                                </>
+                            ) : (
+                                <>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                        <polygon points="5 3 19 12 5 21 5 3"/>
+                                    </svg>
+                                    Generate
+                                </>
+                            )}
+                        </button>
                     </aside>
 
                     {/* Main Content */}
-                    <main style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                    <main style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: '16px' }}>
                         {/* Structure */}
-                        <Card>
+                        <Card style={{ overflow: 'hidden' }}>
                             <CardTitle>Structure</CardTitle>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflowX: 'auto', paddingBottom: '4px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflowX: 'auto', paddingBottom: '8px' }}>
                                 {sections.map(s => {
                                     const { base, duration } = fromApiType(s.type);
                                     const cfg = SECTION_TYPES[base] || { name: base, color: '#888' };
                                     const isResizable = cfg.hasDuration;
-                                    const widths = { short: 60, medium: 80, long: 100 };
+                                    const widths = { short: 75, medium: 95, long: 115 };
                                     const currentWidth = isResizable ? widths[duration] || widths.short : null;
+
+                                    const isDragging = dragId === s.id;
+                                    const isDropTarget = dragOverId === s.id && dragId !== s.id;
+                                    const dragIndex = dragId ? sections.findIndex(sec => sec.id === dragId) : -1;
+                                    const thisIndex = sections.findIndex(sec => sec.id === s.id);
+                                    const showLeftIndicator = isDropTarget && dragIndex > thisIndex;
+                                    const showRightIndicator = isDropTarget && dragIndex < thisIndex;
 
                                     return (
                                         <div
                                             key={s.id}
                                             draggable={!isResizable}
                                             onDragStart={e => !isResizable && handleDragStart(e, s.id)}
-                                            onDragOver={handleDragOver}
+                                            onDragOver={e => handleDragOver(e, s.id)}
                                             onDrop={e => handleDrop(e, s.id)}
+                                            onDragEnd={handleDragEnd}
                                             style={{
                                                 position: 'relative',
                                                 width: isResizable ? currentWidth : 'auto',
@@ -2456,8 +2669,37 @@ const App = () => {
                                                 justifyContent: 'space-between',
                                                 boxSizing: 'border-box',
                                                 flexShrink: 0,
+                                                opacity: isDragging ? 0.4 : 1,
+                                                transition: 'transform 0.15s ease, opacity 0.15s ease',
+                                                transform: isDropTarget ? 'scale(1.05)' : 'scale(1)',
                                             }}
                                         >
+                                            {/* Left drop indicator */}
+                                            {showLeftIndicator && (
+                                                <div style={{
+                                                    position: 'absolute',
+                                                    left: '-5px',
+                                                    top: '4px',
+                                                    bottom: '4px',
+                                                    width: '3px',
+                                                    backgroundColor: '#10B981',
+                                                    borderRadius: '2px',
+                                                    boxShadow: '0 0 8px #10B981',
+                                                }} />
+                                            )}
+                                            {/* Right drop indicator */}
+                                            {showRightIndicator && (
+                                                <div style={{
+                                                    position: 'absolute',
+                                                    right: '-5px',
+                                                    top: '4px',
+                                                    bottom: '4px',
+                                                    width: '3px',
+                                                    backgroundColor: '#10B981',
+                                                    borderRadius: '2px',
+                                                    boxShadow: '0 0 8px #10B981',
+                                                }} />
+                                            )}
                                             <span
                                                 draggable
                                                 onDragStart={e => handleDragStart(e, s.id)}
@@ -2551,11 +2793,203 @@ const App = () => {
                             ))}
                         </div>
                     </main>
+
+                    {/* Right Sidebar - Activity Feed */}
+                    <aside style={{
+                        width: '280px',
+                        flexShrink: 0,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignSelf: 'flex-start',
+                    }}>
+                        <div style={{
+                            backgroundColor: '#282828',
+                            borderRadius: '12px',
+                            padding: '16px',
+                            border: '1px solid #333',
+                            display: 'flex',
+                            flexDirection: 'column',
+                        }}>
+                            <div style={{
+                                fontSize: '14px',
+                                fontWeight: '600',
+                                color: '#999',
+                                marginBottom: '12px',
+                                flexShrink: 0,
+                            }}>Songs</div>
+
+                            <div style={{
+                                maxHeight: '680px',
+                                overflowY: 'auto',
+                                overflowX: 'hidden',
+                                marginRight: '-8px',
+                                paddingRight: '8px',
+                            }}>
+                                {!currentGenPayload && queue.length === 0 && library.length === 0 ? (
+                                    <div style={{ color: '#555', fontSize: '12px', textAlign: 'center', padding: '20px 0' }}>
+                                        No activity yet
+                                    </div>
+                                ) : (
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                        {/* Currently generating */}
+                                        {currentGenPayload && (
+                                            <div style={{
+                                                backgroundColor: '#1e1e1e',
+                                                borderRadius: '8px',
+                                                padding: '10px',
+                                                border: '1px solid #10B981',
+                                                position: 'relative',
+                                                overflow: 'hidden',
+                                            }}>
+                                                {/* Progress bar background */}
+                                                <div style={{
+                                                    position: 'absolute',
+                                                    top: 0,
+                                                    left: 0,
+                                                    bottom: 0,
+                                                    width: estimatedTime > 0 ? `${Math.min((elapsedTime / estimatedTime) * 100, 100)}%` : '30%',
+                                                    background: 'linear-gradient(90deg, rgba(16, 185, 129, 0.15) 0%, rgba(16, 185, 129, 0.05) 100%)',
+                                                    transition: 'width 0.5s ease',
+                                                }} />
+                                                <div style={{ position: 'relative', zIndex: 1 }}>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                                                        <div style={{
+                                                            width: '8px',
+                                                            height: '8px',
+                                                            borderRadius: '50%',
+                                                            backgroundColor: '#10B981',
+                                                            animation: 'pulse 1.5s infinite',
+                                                        }} />
+                                                        <span style={{ fontSize: '12px', fontWeight: '500', color: '#e0e0e0', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            {currentGenPayload.title || 'Untitled'}
+                                                        </span>
+                                                    </div>
+                                                    <div style={{ fontSize: '10px', color: '#888', display: 'flex', justifyContent: 'space-between' }}>
+                                                        <span>Generating...</span>
+                                                        <span>{formatTime(elapsedTime)}{estimatedTime > 0 ? ` / ~${formatTime(estimatedTime)}` : ''}</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Queued items */}
+                                        {queue.map((item, index) => (
+                                            <div key={`q-${index}`} style={{
+                                                backgroundColor: '#1e1e1e',
+                                                borderRadius: '8px',
+                                                padding: '10px',
+                                                border: '1px solid #3a3a3a',
+                                            }}>
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                                                    <div style={{
+                                                        width: '16px',
+                                                        height: '16px',
+                                                        borderRadius: '4px',
+                                                        backgroundColor: '#6366F1',
+                                                        display: 'flex',
+                                                        alignItems: 'center',
+                                                        justifyContent: 'center',
+                                                        fontSize: '9px',
+                                                        fontWeight: '600',
+                                                        color: '#fff',
+                                                    }}>{index + 1}</div>
+                                                    <span style={{ fontSize: '12px', fontWeight: '500', color: '#e0e0e0', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                        {item.title || 'Untitled'}
+                                                    </span>
+                                                    <button
+                                                        onClick={() => removeFromQueue(index)}
+                                                        style={{
+                                                            background: 'none',
+                                                            border: 'none',
+                                                            color: '#666',
+                                                            cursor: 'pointer',
+                                                            padding: '2px',
+                                                            display: 'flex',
+                                                        }}
+                                                    >
+                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                            <path d="M18 6L6 18M6 6l12 12"/>
+                                                        </svg>
+                                                    </button>
+                                                </div>
+                                                <div style={{ fontSize: '10px', color: '#666' }}>In queue</div>
+                                            </div>
+                                        ))}
+
+                                        {/* All library items */}
+                                        {library.map(item => {
+                                            const meta = item.metadata || {};
+                                            const isPlaying = activityPlayingId === item.id;
+                                            const canPlay = item.status === 'completed' && (item.output_file || (item.output_files && item.output_files.length > 0));
+                                            return (
+                                                <div key={item.id} style={{
+                                                    backgroundColor: isPlaying ? '#1a2e1a' : '#1e1e1e',
+                                                    borderRadius: '8px',
+                                                    padding: '10px',
+                                                    border: `1px solid ${isPlaying ? '#10B981' : item.status === 'failed' || item.status === 'stopped' ? '#EF4444' : '#3a3a3a'}`,
+                                                    cursor: canPlay ? 'pointer' : 'default',
+                                                    transition: 'all 0.15s',
+                                                }}
+                                                onMouseEnter={e => { if (canPlay) e.currentTarget.style.borderColor = '#10B981'; }}
+                                                onMouseLeave={e => { if (!isPlaying) e.currentTarget.style.borderColor = item.status === 'failed' || item.status === 'stopped' ? '#EF4444' : '#3a3a3a'; }}
+                                                onClick={() => canPlay && playActivityAudio(item)}
+                                                >
+                                                    {/* Title with play indicator */}
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+                                                        {canPlay && (
+                                                            <div style={{
+                                                                width: '14px',
+                                                                height: '14px',
+                                                                borderRadius: '50%',
+                                                                backgroundColor: isPlaying ? '#10B981' : '#3a3a3a',
+                                                                display: 'flex',
+                                                                alignItems: 'center',
+                                                                justifyContent: 'center',
+                                                                flexShrink: 0,
+                                                            }}>
+                                                                {isPlaying && isAudioPlaying ? (
+                                                                    <svg width="6" height="6" viewBox="0 0 24 24" fill="#fff">
+                                                                        <rect x="6" y="4" width="4" height="16"/>
+                                                                        <rect x="14" y="4" width="4" height="16"/>
+                                                                    </svg>
+                                                                ) : (
+                                                                    <svg width="6" height="6" viewBox="0 0 24 24" fill={isPlaying ? '#fff' : '#888'}>
+                                                                        <path d="M8 5v14l11-7z"/>
+                                                                    </svg>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                        {!canPlay && (item.status === 'failed' || item.status === 'stopped') && (
+                                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#EF4444" strokeWidth="2" style={{ flexShrink: 0 }}>
+                                                                <path d="M18 6L6 18M6 6l12 12"/>
+                                                            </svg>
+                                                        )}
+                                                        <span style={{ fontSize: '12px', fontWeight: '500', color: '#e0e0e0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            {meta.title || 'Untitled'}
+                                                        </span>
+                                                    </div>
+                                                    {/* Metadata line 1: Genre, Mood, Timbre, Instrument */}
+                                                    <div style={{ fontSize: '10px', color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: '2px' }}>
+                                                        {[meta.genre, meta.mood, meta.timbre, meta.instrument].filter(Boolean).join(' • ') || 'No tags'}
+                                                    </div>
+                                                    {/* Metadata line 2: Reference + Time */}
+                                                    <div style={{ fontSize: '10px', color: '#666', display: 'flex', justifyContent: 'space-between' }}>
+                                                        <span>{meta.reference_audio_id ? '🎵 Reference' : ''}</span>
+                                                        <span>{new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </aside>
                 </div>
             </div>
 
             {/* Library View */}
-            <div style={{ display: activeTab === 'library' ? 'block' : 'none' }}>
+            <div style={{ display: activeTab === 'library' ? 'block' : 'none', paddingBottom: '100px' }}>
                 <div style={{ maxWidth: '900px', margin: '0 auto', padding: '0 24px' }}>
                     <h2 style={{ fontSize: '20px', fontWeight: '600', marginBottom: '20px', color: '#e0e0e0' }}>
                         Your Songs ({library.filter(l => l.status === 'completed').length})
@@ -2594,7 +3028,7 @@ const App = () => {
                                 />
                             ))}
                             {/* Library items (exclude currently generating one to avoid duplicate) */}
-                            {library.filter(item => !currentGenId || item.id !== currentGenId).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id)} />)}
+                            {library.filter(item => !currentGenId || item.id !== currentGenId).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id)} onPlay={playActivityAudio} isCurrentlyPlaying={activityPlayingId === item.id} isAudioPlaying={isAudioPlaying} />)}
                         </div>
                     )}
                 </div>
@@ -2631,117 +3065,165 @@ const App = () => {
                 </div>
             )}
 
-            {/* Footer - only show on Create tab */}
+            {/* Media Player Footer - always visible */}
             <footer style={{
                 position: 'fixed',
-                bottom: 0,
-                left: 0,
-                right: 0,
-                background: 'linear-gradient(135deg, rgba(30, 30, 30, 0.5) 0%, rgba(40, 40, 45, 0.45) 100%)',
-                backdropFilter: 'blur(20px)',
-                WebkitBackdropFilter: 'blur(20px)',
-                borderTop: '1px solid rgba(255, 255, 255, 0.08)',
-                padding: '14px 24px',
-                display: activeTab === 'create' ? 'flex' : 'none',
+                bottom: '16px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                width: 'calc(100% - 64px)',
+                maxWidth: '900px',
+                background: 'linear-gradient(135deg, rgba(25, 25, 28, 0.85) 0%, rgba(35, 35, 40, 0.9) 100%)',
+                backdropFilter: 'blur(24px) saturate(180%)',
+                WebkitBackdropFilter: 'blur(24px) saturate(180%)',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                borderRadius: '16px',
+                padding: '12px 20px',
+                display: 'flex',
                 alignItems: 'center',
-                gap: '12px',
-                boxShadow: '0 -4px 30px rgba(0, 0, 0, 0.4)',
+                gap: '20px',
+                boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05) inset',
                 zIndex: 100,
             }}>
-                {/* Generate / Add to Queue button */}
-                <button
-                    onClick={generate}
-                    style={{
-                        backgroundColor: '#10B981',
-                        color: '#fff',
-                        border: 'none',
-                        borderRadius: '10px',
-                        padding: '14px 28px',
-                        fontSize: '15px',
-                        fontWeight: '600',
-                        cursor: 'pointer',
+                {/* Song Info */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: '200px', maxWidth: '300px' }}>
+                    <div style={{
+                        width: '48px',
+                        height: '48px',
+                        borderRadius: '6px',
+                        backgroundColor: activityPlayingItem ? '#10B981' : '#3a3a3a',
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        gap: '8px',
-                        minWidth: '130px',
-                    }}
-                >
-                    {generating ? (
-                        <>
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                <path d="M12 5v14M5 12h14"/>
-                            </svg>
-                            Queue
-                        </>
-                    ) : 'Generate'}
-                </button>
-
-                {/* Stop button - only show when generating */}
-                {generating && (
-                    <button
-                        onClick={stopGeneration}
-                        style={{
-                            backgroundColor: 'transparent',
-                            color: '#EF4444',
-                            border: '1px solid #EF4444',
-                            borderRadius: '10px',
-                            padding: '13px 20px',
-                            fontSize: '14px',
-                            fontWeight: '500',
-                            cursor: 'pointer',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '6px',
-                        }}
-                    >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                            <rect x="6" y="6" width="12" height="12" rx="1"/>
+                        flexShrink: 0,
+                    }}>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={activityPlayingItem ? '#fff' : '#666'} strokeWidth="2">
+                            <path d="M9 18V5l12-2v13"/>
+                            <circle cx="6" cy="18" r="3"/>
+                            <circle cx="18" cy="16" r="3"/>
                         </svg>
-                        Stop
-                    </button>
-                )}
-
-                {generating && (
-                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <span style={{ fontSize: '13px', color: '#ccc' }}>{status}</span>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                                {queue.length > 0 && (
-                                    <span
-                                        style={{ fontSize: '12px', color: '#888', cursor: 'pointer' }}
-                                        onClick={clearQueue}
-                                        title="Click to clear queue"
-                                    >
-                                        {queue.length} in queue
-                                    </span>
-                                )}
-                                <span style={{ fontSize: '13px', color: '#10B981', fontWeight: '600' }}>
-                                    {estimatedTime ? formatTimeRemaining(Math.max(0, estimatedTime - elapsedTime)) : 'calculating...'}
-                                </span>
-                            </div>
+                    </div>
+                    <div style={{ overflow: 'hidden' }}>
+                        <div style={{ fontSize: '13px', fontWeight: '500', color: activityPlayingItem ? '#fff' : '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {activityPlayingItem?.metadata?.title || 'No song selected'}
                         </div>
-                        <div
-                            className="progress-bar-indeterminate"
+                        <div style={{ fontSize: '11px', color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {activityPlayingItem ? ([activityPlayingItem.metadata?.genre, activityPlayingItem.metadata?.mood].filter(Boolean).join(' • ') || 'No tags') : 'Click a song to play'}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Center Controls */}
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
+                    {/* Playback Controls */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                        <button onClick={playPrevSong} disabled={!activityPlayingItem} style={{ background: 'none', border: 'none', color: activityPlayingItem ? '#888' : '#444', cursor: activityPlayingItem ? 'pointer' : 'default', padding: '4px' }}>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/>
+                            </svg>
+                        </button>
+                        <button
+                            onClick={() => activityPlayingItem && playActivityAudio(activityPlayingItem)}
+                            disabled={!activityPlayingItem}
                             style={{
-                                height: '6px',
-                                borderRadius: '3px',
+                                background: activityPlayingItem ? '#fff' : '#3a3a3a',
+                                border: 'none',
+                                borderRadius: '50%',
+                                width: '36px',
+                                height: '36px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                cursor: activityPlayingItem ? 'pointer' : 'default',
                             }}
-                        />
+                        >
+                            {isAudioPlaying ? (
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="#000">
+                                    <rect x="6" y="4" width="4" height="16"/>
+                                    <rect x="14" y="4" width="4" height="16"/>
+                                </svg>
+                            ) : (
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill={activityPlayingItem ? '#000' : '#666'} style={{ marginLeft: '2px' }}>
+                                    <path d="M8 5v14l11-7z"/>
+                                </svg>
+                            )}
+                        </button>
+                        <button onClick={playNextSong} disabled={!activityPlayingItem} style={{ background: 'none', border: 'none', color: activityPlayingItem ? '#888' : '#444', cursor: activityPlayingItem ? 'pointer' : 'default', padding: '4px' }}>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
+                            </svg>
+                        </button>
                     </div>
-                )}
 
-                {audio && !generating && (
-                    <div style={{ flex: 1, display: 'flex', gap: '12px', alignItems: 'center' }}>
-                        {audio.files?.map((f, i) => <DarkAudioPlayer key={i} src={`/api/audio/${audio.id}/${i}`} />)}
+                    {/* Progress Bar */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', width: '100%', maxWidth: '600px' }}>
+                        <span style={{ fontSize: '11px', color: '#888', minWidth: '35px', textAlign: 'right' }}>
+                            {formatTime(audioProgress)}
+                        </span>
+                        <div
+                            style={{
+                                flex: 1,
+                                height: '4px',
+                                backgroundColor: '#3a3a3a',
+                                borderRadius: '2px',
+                                cursor: activityPlayingItem ? 'pointer' : 'default',
+                                position: 'relative',
+                            }}
+                            onClick={(e) => {
+                                if (!activityPlayingItem) return;
+                                const rect = e.currentTarget.getBoundingClientRect();
+                                const percent = (e.clientX - rect.left) / rect.width;
+                                seekAudio(percent * audioDuration);
+                            }}
+                        >
+                            <div style={{
+                                position: 'absolute',
+                                left: 0,
+                                top: 0,
+                                height: '100%',
+                                width: `${audioDuration ? (audioProgress / audioDuration) * 100 : 0}%`,
+                                backgroundColor: '#10B981',
+                                borderRadius: '2px',
+                            }} />
+                        </div>
+                        <span style={{ fontSize: '11px', color: '#888', minWidth: '35px' }}>
+                            {formatTime(audioDuration)}
+                        </span>
                     </div>
-                )}
+                </div>
 
-                {error && !generating && (
-                    <div style={{ flex: 1, color: '#EF4444', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {error}
-                    </div>
-                )}
+                {/* Volume Control */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: '120px' }}>
+                    <button
+                        onClick={() => setVolume(audioVolume > 0 ? 0 : 1)}
+                        style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: '4px' }}
+                    >
+                        {audioVolume === 0 ? (
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+                                <line x1="23" y1="9" x2="17" y2="15"/>
+                                <line x1="17" y1="9" x2="23" y2="15"/>
+                            </svg>
+                        ) : (
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+                                <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                            </svg>
+                        )}
+                    </button>
+                    <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        value={audioVolume}
+                        onChange={(e) => setVolume(parseFloat(e.target.value))}
+                        style={{
+                            width: '80px',
+                            accentColor: '#10B981',
+                        }}
+                    />
+                </div>
             </footer>
         </div>
     );
