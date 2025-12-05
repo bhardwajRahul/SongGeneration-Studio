@@ -1,0 +1,51 @@
+# Pinokio runtime config
+cache/
+ENVIRONMENT
+
+# Virtual environments
+app/env/
+env/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs
+logs/
+
+# Pinokio temp files
+.pinokio-temp/
+
+# AI tool local settings
+.claude/
+
+# Runtime generated files
+app/output/
+app/uploads/
+
+# Model files (downloaded during install)
+app/songgeneration_*/
+app/*.pt
+app/*.safetensors
+app/*.bin
+
+# Tokenizer model files
+app/codeclm/tokenizer/Flow1dVAE/*.pt
+app/codeclm/tokenizer/Flow1dVAE/*.safetensors
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
