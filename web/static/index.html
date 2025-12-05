@@ -2630,12 +2630,12 @@ const App = () => {
                 </div>
             )}
 
-            {/* Footer */}
+            {/* Footer - only show on Create tab */}
             <footer style={{
                 backgroundColor: '#232323',
                 borderTop: '1px solid #333',
                 padding: '14px 24px',
-                display: 'flex',
+                display: activeTab === 'create' ? 'flex' : 'none',
                 alignItems: 'center',
                 gap: '12px',
                 flexShrink: 0,
