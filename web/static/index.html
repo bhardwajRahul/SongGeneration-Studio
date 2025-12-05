@@ -2429,7 +2429,7 @@ const App = () => {
                                     const { base, duration } = fromApiType(s.type);
                                     const cfg = SECTION_TYPES[base] || { name: base, color: '#888' };
                                     const isResizable = cfg.hasDuration;
-                                    const widths = { short: 70, medium: 100 };
+                                    const widths = { short: 60, medium: 80, long: 100 };
                                     const currentWidth = isResizable ? widths[duration] || widths.short : null;
 
                                     return (
@@ -2470,7 +2470,7 @@ const App = () => {
                                                         opacity: 0.6,
                                                         fontWeight: '400',
                                                     }}>
-                                                        {duration === 'medium' ? '15s' : '5s'}
+                                                        {duration === 'long' ? 'L' : duration === 'medium' ? 'M' : 'S'}
                                                     </span>
                                                 )}
                                             </span>
@@ -2484,9 +2484,10 @@ const App = () => {
                                                         const onMouseMove = (moveE) => {
                                                             const delta = moveE.clientX - startX;
                                                             const newWidth = startWidth + delta;
-                                                            // Snap to short or medium based on width
-                                                            const threshold = (widths.short + widths.medium) / 2;
-                                                            const newDuration = newWidth > threshold ? 'medium' : 'short';
+                                                            // Snap to short, medium, or long based on width
+                                                            const thresholdSM = (widths.short + widths.medium) / 2;
+                                                            const thresholdML = (widths.medium + widths.long) / 2;
+                                                            const newDuration = newWidth > thresholdML ? 'long' : (newWidth > thresholdSM ? 'medium' : 'short');
                                                             if (newDuration !== duration) {
                                                                 updateSection(s.id, { type: `${base}-${newDuration}` });
                                                             }
