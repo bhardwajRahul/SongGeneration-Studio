@@ -36,11 +36,11 @@ module.exports = {
     },
     // 4. Download runtime models (ckpt + third_party)
     {
-      method: "shell.run",
+      method: "hf.download",
       params: {
-        venv: "env",
         path: "app",
-        message: "huggingface-cli download lglg666/SongGeneration-Runtime --local-dir runtime"
+        _: ["lglg666/SongGeneration-Runtime"],
+        "local-dir": "runtime"
       }
     },
     // 5. Create junction links for ckpt and third_party
@@ -60,29 +60,29 @@ module.exports = {
     },
     // 6. Download base model (~24GB)
     {
-      method: "shell.run",
+      method: "hf.download",
       params: {
-        venv: "env",
         path: "app",
-        message: "huggingface-cli download lglg666/SongGeneration-base --local-dir songgeneration_base"
+        _: ["lglg666/SongGeneration-base"],
+        "local-dir": "songgeneration_base"
       }
     },
     // 7. Download base-new model
     {
-      method: "shell.run",
+      method: "hf.download",
       params: {
-        venv: "env",
         path: "app",
-        message: "huggingface-cli download lglg666/SongGeneration-base-new --local-dir songgeneration_base_new"
+        _: ["lglg666/SongGeneration-base-new"],
+        "local-dir": "songgeneration_base_new"
       }
     },
     // 8. Download base-full model
     {
-      method: "shell.run",
+      method: "hf.download",
       params: {
-        venv: "env",
         path: "app",
-        message: "huggingface-cli download lglg666/SongGeneration-base-full --local-dir songgeneration_base_full"
+        _: ["lglg666/SongGeneration-base-full"],
+        "local-dir": "songgeneration_base_full"
       }
     },
     // 9. Copy API file
