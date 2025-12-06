@@ -95,9 +95,10 @@ module.exports = {
     },
     // 10. Create web/static directory and copy files
     {
-      method: "fs.mkdir",
+      method: "shell.run",
       params: {
-        path: "app/web/static"
+        path: "app",
+        message: "{{platform === 'win32' ? 'if not exist web\\\\static mkdir web\\\\static' : 'mkdir -p web/static'}}"
       }
     },
     {
