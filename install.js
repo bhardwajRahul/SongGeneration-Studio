@@ -93,14 +93,7 @@ module.exports = {
         dest: "app/api.py"
       }
     },
-    // 10. Create web/static directory and copy files
-    {
-      method: "shell.run",
-      params: {
-        path: "app",
-        message: "{{platform === 'win32' ? 'if not exist web\\\\static mkdir web\\\\static' : 'mkdir -p web/static'}}"
-      }
-    },
+    // 10. Copy web files
     {
       method: "fs.copy",
       params: {

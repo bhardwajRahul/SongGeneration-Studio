@@ -24,13 +24,6 @@ module.exports = {
       }
     },
     {
-      method: "shell.run",
-      params: {
-        path: "app",
-        message: "{{platform === 'win32' ? 'if not exist web\\\\static mkdir web\\\\static' : 'mkdir -p web/static'}}"
-      }
-    },
-    {
       method: "fs.copy",
       params: {
         src: "web/static/index.html",
