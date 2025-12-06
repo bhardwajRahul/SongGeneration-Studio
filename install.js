@@ -34,31 +34,16 @@ module.exports = {
         ]
       }
     },
-    // 4. Download runtime models (ckpt + third_party)
+    // 4. Download runtime files (ckpt + third_party) directly to app/
     {
       method: "hf.download",
       params: {
         path: "app",
         _: ["lglg666/SongGeneration-Runtime"],
-        "local-dir": "runtime"
+        "local-dir": "."
       }
     },
-    // 5. Create junction links for ckpt and third_party
-    {
-      method: "fs.link",
-      params: {
-        src: "app/runtime/ckpt",
-        dest: "app/ckpt"
-      }
-    },
-    {
-      method: "fs.link",
-      params: {
-        src: "app/runtime/third_party",
-        dest: "app/third_party"
-      }
-    },
-    // 6. Download base model (~24GB)
+    // 5. Download base model (~24GB)
     {
       method: "hf.download",
       params: {
@@ -67,7 +52,7 @@ module.exports = {
         "local-dir": "songgeneration_base"
       }
     },
-    // 7. Download base-new model
+    // 6. Download base-new model
     {
       method: "hf.download",
       params: {
@@ -76,7 +61,7 @@ module.exports = {
         "local-dir": "songgeneration_base_new"
       }
     },
-    // 8. Download base-full model
+    // 7. Download base-full model
     {
       method: "hf.download",
       params: {
@@ -85,7 +70,7 @@ module.exports = {
         "local-dir": "songgeneration_base_full"
       }
     },
-    // 9. Copy API file
+    // 8. Copy API file
     {
       method: "fs.copy",
       params: {
@@ -93,7 +78,7 @@ module.exports = {
         dest: "app/api.py"
       }
     },
-    // 10. Copy web files
+    // 9. Copy web files
     {
       method: "fs.copy",
       params: {
