@@ -909,15 +909,41 @@ async def upload_cover(gen_id: str, file: UploadFile = File(...)):
     if gen_id not in generations and not output_subdir.exists():
         raise HTTPException(404, "Generation not found")
 
-    allowed_ext = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
-    if not file.filename.lower().endswith(allowed_ext):
-        raise HTTPException(400, f"Invalid file type. Allowed: {allowed_ext}")
+    # Log the incoming file details for debugging
+    print(f"[API] Cover upload for {gen_id}: filename='{file.filename}', content_type='{file.content_type}'")
+
+    # Determine file extension from filename or content-type
+    allowed_ext = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.jfif', '.heic', '.avif')
+    ext = Path(file.filename).suffix.lower() if file.filename else ''
+
+    # If no valid extension from filename, try to determine from content-type
+    if not ext or ext not in allowed_ext:
+        content_type_to_ext = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+            'image/bmp': '.bmp',
+            'image/tiff': '.tiff',
+            'image/heic': '.heic',
+            'image/avif': '.avif',
+        }
+        ext = content_type_to_ext.get(file.content_type, ext)
+
+    # Normalize some extensions
+    if ext in ('.jfif', '.bmp', '.tiff', '.heic', '.avif'):
+        ext = '.jpg'  # Convert to jpg for compatibility
+
+    if not ext or ext not in ('.jpg', '.jpeg', '.png', '.gif', '.webp'):
+        print(f"[API] Cover upload rejected: invalid file type ext='{ext}'")
+        raise HTTPException(400, f"Invalid file type. Got extension '{ext}', content-type '{file.content_type}'. Allowed: jpg, png, gif, webp")
 
     if not output_subdir.exists():
         output_subdir.mkdir(parents=True, exist_ok=True)
 
-    # Save cover image (always as cover.jpg/png based on upload)
-    ext = Path(file.filename).suffix.lower()
+    # Normalize extension for storage
+    if ext == '.jpeg':
+        ext = '.jpg'
     cover_path = output_subdir / f"cover{ext}"
 
     # Remove any existing cover files
