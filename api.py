@@ -1032,11 +1032,11 @@ async def export_video(gen_id: str, background_tasks: BackgroundTasks):
 
     print(f"[API] Exporting video for {gen_id}, duration: {duration}s")
 
-    # Step 1: Generate bright waveform image
+    # Step 1: Generate bright waveform image (square format: 1080x1080)
     waveform_cmd = [
         'ffmpeg', '-y', '-i', str(audio_file),
         '-filter_complex',
-        'showwavespic=s=1880x160:colors=#10B981|#10B981:scale=sqrt',
+        'showwavespic=s=1040x120:colors=#10B981|#10B981:scale=sqrt',
         '-frames:v', '1',
         str(waveform_path)
     ]
@@ -1045,31 +1045,29 @@ async def export_video(gen_id: str, background_tasks: BackgroundTasks):
         print(f"[API] Waveform generation failed: {result.stderr}")
         raise HTTPException(500, f"Waveform generation failed: {result.stderr}")
 
-    # Step 2: Create video with progressive waveform reveal
+    # Step 2: Create video with progressive waveform reveal (1080x1080 square)
     # IMPORTANT: drawbox does NOT support 't' variable for animation!
     # Must use color source + overlay filter instead, as overlay DOES support 't'
-    # Reference: https://video.stackexchange.com/questions/30305/
 
     filter_complex = (
-        # Scale background image
-        f"[1:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080[bg];"
-        # Add semi-transparent dark bar at bottom (static, so drawbox is fine here)
-        f"[bg]drawbox=x=0:y=ih-220:w=iw:h=220:color=black@0.7:t=fill[bg2];"
-        # Overlay bright waveform
-        f"[bg2][2:v]overlay=20:H-190[v1];"
-        # Create dark overlay rectangle for unplayed portion (color source with alpha)
-        f"color=c=0x0d1f17:s=1880x160:r=30,format=rgba,colorchannelmixer=aa=0.75[dark];"
-        # Animate dark overlay using overlay filter - 't' works here!
-        # Moves right over time, revealing the bright waveform progressively
-        f"[v1][dark]overlay=x='20+(t/{duration})*1880':y=H-190:shortest=1[v2];"
+        # Scale background image to square 1080x1080
+        f"[1:v]scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080[bg];"
+        # Add semi-transparent dark bar at bottom
+        f"[bg]drawbox=x=0:y=ih-160:w=iw:h=160:color=black@0.7:t=fill[bg2];"
+        # Overlay bright waveform (centered: x=20, y=H-140 puts it 20px from bottom)
+        f"[bg2][2:v]overlay=20:H-140[v1];"
+        # Create dark overlay rectangle for unplayed portion
+        f"color=c=0x0d1f17:s=1040x120:r=30,format=rgba,colorchannelmixer=aa=0.75[dark];"
+        # Animate dark overlay - moves right over time
+        f"[v1][dark]overlay=x='20+(t/{duration})*1040':y=H-140:shortest=1[v2];"
         # Create white progress line (4px wide)
-        f"color=c=white:s=4x164:r=30[line];"
-        # Animate progress line - follows the reveal edge
-        f"[v2][line]overlay=x='18+(t/{duration})*1880':y=H-192:shortest=1[v3];"
-        # Create glow effect (wider, semi-transparent)
-        f"color=c=white:s=12x164:r=30,format=rgba,colorchannelmixer=aa=0.2[glow];"
+        f"color=c=white:s=4x124:r=30[line];"
+        # Animate progress line
+        f"[v2][line]overlay=x='18+(t/{duration})*1040':y=H-142:shortest=1[v3];"
+        # Create glow effect
+        f"color=c=white:s=12x124:r=30,format=rgba,colorchannelmixer=aa=0.2[glow];"
         # Animate glow
-        f"[v3][glow]overlay=x='12+(t/{duration})*1880':y=H-192:shortest=1[vout]"
+        f"[v3][glow]overlay=x='12+(t/{duration})*1040':y=H-142:shortest=1[vout]"
     )
 
     video_cmd = [

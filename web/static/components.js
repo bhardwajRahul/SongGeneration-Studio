@@ -1516,13 +1516,21 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                 {isGenerating ? (
                     <SpinnerIcon />
                 ) : canPlay ? (
-                    <div className="album-cover-overlay">
-                        {isCurrentlyPlaying && isAudioPlaying ? (
+                    coverUrl ? (
+                        <div className="album-cover-overlay">
+                            {isCurrentlyPlaying && isAudioPlaying ? (
+                                <PauseLargeIcon />
+                            ) : (
+                                <PlayLargeIcon style={{ marginLeft: '3px' }} />
+                            )}
+                        </div>
+                    ) : (
+                        isCurrentlyPlaying && isAudioPlaying ? (
                             <PauseLargeIcon />
                         ) : (
                             <PlayLargeIcon style={{ marginLeft: '3px' }} />
-                        )}
-                    </div>
+                        )
+                    )
                 ) : !coverUrl ? (
                     <MusicNoteIcon />
                 ) : null}
