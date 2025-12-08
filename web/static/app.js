@@ -60,7 +60,7 @@ var App = () => {
     const pollRef = useRef(null);
     const addBtnRef = useRef(null);
     const timerRef = useRef(null);
-    const idlePollRef = useRef(null);  // Polls for server-started generations when idle
+    const idlePollRef = useRef(null);  // Legacy ref, kept for cleanup compatibility
 
     // Activity panel audio / Media player
     const [activityPlayingId, setActivityPlayingId] = useState(null);
@@ -76,6 +76,122 @@ var App = () => {
     const [mainHover, mainHoverHandlers] = useHover();
     const [rightHover, rightHoverHandlers] = useHover();
     const [libraryHover, libraryHoverHandlers] = useHover();
+
+    // SSE connection for real-time updates
+    const sseRef = useRef(null);
+    const sseReconnectRef = useRef(null);
+
+    // Connect to Server-Sent Events for real-time updates
+    useEffect(() => {
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 10;
+        const baseReconnectDelay = 1000;
+
+        const connectSSE = () => {
+            if (sseRef.current) {
+                sseRef.current.close();
+            }
+
+            console.log('[SSE] Connecting to /api/events...');
+            const eventSource = new EventSource('/api/events');
+            sseRef.current = eventSource;
+
+            eventSource.onopen = () => {
+                console.log('[SSE] Connected');
+                reconnectAttempts = 0;
+            };
+
+            eventSource.onerror = (e) => {
+                console.error('[SSE] Connection error:', e);
+                eventSource.close();
+                sseRef.current = null;
+
+                // Reconnect with exponential backoff
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    const delay = baseReconnectDelay * Math.pow(2, reconnectAttempts);
+                    reconnectAttempts++;
+                    console.log(`[SSE] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+                    sseReconnectRef.current = setTimeout(connectSSE, delay);
+                } else {
+                    console.warn('[SSE] Max reconnect attempts reached, falling back to polling');
+                }
+            };
+
+            // Handle queue updates
+            eventSource.addEventListener('queue', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    if (data.queue) {
+                        setQueue(data.queue);
+                    }
+                } catch (err) {
+                    console.error('[SSE] Error parsing queue event:', err);
+                }
+            });
+
+            // Handle generation updates
+            eventSource.addEventListener('generation', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    if (data.generation && data.id) {
+                        const gen = data.generation;
+                        // Update progress if this is the current generation
+                        if (data.id === currentGenId) {
+                            setProgress(gen.progress || 0);
+                            setStatus(gen.message || '');
+                            if (typeof gen.elapsed_seconds === 'number') {
+                                setElapsedTime(gen.elapsed_seconds);
+                            }
+                        }
+                        // Handle completion
+                        if (gen.status === 'completed' || gen.status === 'failed' || gen.status === 'stopped') {
+                            // Refresh library to get full updated data
+                            loadLibrary();
+                        }
+                    }
+                } catch (err) {
+                    console.error('[SSE] Error parsing generation event:', err);
+                }
+            });
+
+            // Handle library updates
+            eventSource.addEventListener('library', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    if (data.generations) {
+                        // Check if any generation is now active that we should track
+                        const activeGen = data.generations.find(g => g.status === 'pending' || g.status === 'processing');
+                        if (activeGen && !currentGenId && !generating) {
+                            console.log('[SSE] Detected active generation:', activeGen.id);
+                            // Refresh library to get full data and trigger restoration
+                            loadLibrary();
+                        }
+                        // Check if current generation completed
+                        if (currentGenId) {
+                            const current = data.generations.find(g => g.id === currentGenId);
+                            if (current && (current.status === 'completed' || current.status === 'failed' || current.status === 'stopped')) {
+                                loadLibrary();
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.error('[SSE] Error parsing library event:', err);
+                }
+            });
+        };
+
+        connectSSE();
+
+        return () => {
+            if (sseRef.current) {
+                sseRef.current.close();
+                sseRef.current = null;
+            }
+            if (sseReconnectRef.current) {
+                clearTimeout(sseReconnectRef.current);
+            }
+        };
+    }, [currentGenId, generating]);
 
     // Load queue from server
     const loadQueue = async () => {
@@ -127,16 +243,19 @@ var App = () => {
         return () => clearInterval(interval);
     }, [downloadPolling]);
 
-    // Periodic sync: poll queue and library to detect when other clients start/complete generations
-    // This ensures all browser windows stay in sync
+    // Fallback periodic sync (only when SSE is not connected)
+    // SSE handles real-time updates, this is just a safety net
     useEffect(() => {
         // Only poll when NOT currently tracking a generation (those have their own polling)
         if (currentGenId) return;
 
         const syncInterval = setInterval(async () => {
-            // Refresh queue and library to detect changes from other clients
-            await Promise.all([loadQueue(), loadLibrary()]);
-        }, 3000);  // Poll every 3 seconds
+            // Only sync if SSE is disconnected
+            if (!sseRef.current || sseRef.current.readyState !== EventSource.OPEN) {
+                console.log('[Fallback] SSE disconnected, polling...');
+                await Promise.all([loadQueue(), loadLibrary()]);
+            }
+        }, 10000);  // Fallback poll every 10 seconds
 
         return () => clearInterval(syncInterval);
     }, [currentGenId]);
@@ -390,7 +509,17 @@ var App = () => {
             const r = await fetch('/api/generations');
             if (r.ok) {
                 const data = await r.json();
-                setLibrary(data.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+                const sorted = data.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                setLibrary(sorted);
+
+                // Update activityPlayingItem if it exists in the new data (to get updated cover, title, etc.)
+                setActivityPlayingItem(current => {
+                    if (current) {
+                        const updatedItem = sorted.find(item => item.id === current.id);
+                        return updatedItem || current;
+                    }
+                    return current;
+                });
             }
         } catch (e) { console.error(e); }
     };
@@ -486,9 +615,7 @@ var App = () => {
     };
 
     // Cleanup helper for generation completion/failure
-    // NOTE: Queue processing is now handled server-side to prevent race conditions
-    // when multiple browser clients are connected. The server auto-starts the next
-    // queued item when a generation completes.
+    // SSE handles detecting new server-started generations automatically
     const cleanupGeneration = useCallback(async () => {
         clearInterval(pollRef.current);
         clearInterval(timerRef.current);
@@ -501,84 +628,21 @@ var App = () => {
         setElapsedTime(0);
         setGenerating(false);
 
-        // IMPORTANT: Reset restoredRef so the useEffect can detect new server-started generations
+        // Reset restoredRef so the useEffect can detect new server-started generations
         restoredRef.current = false;
 
         // Refresh library and queue from server
         await loadLibrary();
         await loadQueue();
 
-        // Start brief idle polling to detect server-started generations from queue
-        // The server may have already started the next generation
-        console.log('[Cleanup] Starting brief idle polling for server-started generations');
-        let pollCount = 0;
-        const maxPolls = 10; // Poll for up to 30 seconds (10 polls * 3 sec)
-
-        const checkForNewGen = async () => {
-            try {
-                const [queueRes, libRes] = await Promise.all([
-                    fetch('/api/queue'),
-                    fetch('/api/generations')
-                ]);
-
-                if (queueRes.ok) {
-                    setQueue(await queueRes.json());
-                }
-
-                if (libRes.ok) {
-                    const libData = await libRes.json();
-                    setLibrary(libData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
-
-                    // Check if server started a new generation
-                    const activeGen = libData.find(g => g.status === 'pending' || g.status === 'processing');
-                    if (activeGen) {
-                        console.log(`[Cleanup] Found server-started generation: ${activeGen.id}`);
-                        clearInterval(idlePollRef.current);
-                        idlePollRef.current = null;
-                        // The existing useEffect will pick this up since we reset restoredRef
-                        return;
-                    }
-                }
-
-                pollCount++;
-                if (pollCount >= maxPolls) {
-                    console.log('[Cleanup] Idle polling complete - no new generation');
-                    clearInterval(idlePollRef.current);
-                    idlePollRef.current = null;
-                }
-            } catch (e) {
-                console.error('[Cleanup] Idle poll error:', e);
-            }
-        };
-
-        // First check immediately
-        await checkForNewGen();
-        // Then continue polling
-        if (!idlePollRef.current && pollCount < maxPolls) {
-            idlePollRef.current = setInterval(checkForNewGen, 3000);
-        }
+        // SSE will automatically notify us when a new generation starts
+        console.log('[Cleanup] Generation cleanup complete, SSE will handle new generation detection');
     }, []);
 
     const poll = useCallback(async (id) => {
         try {
-            // Poll generation status, queue, AND library for cross-client sync
-            const [genResponse, queueResponse, libraryResponse] = await Promise.all([
-                fetch(`/api/generation/${id}`),
-                fetch('/api/queue'),
-                fetch('/api/generations')
-            ]);
-
-            // Update queue from server
-            if (queueResponse.ok) {
-                const queueData = await queueResponse.json();
-                setQueue(queueData);
-            }
-
-            // Update library from server (ensures all clients see completed/new generations)
-            if (libraryResponse.ok) {
-                const libraryData = await libraryResponse.json();
-                setLibrary(libraryData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
-            }
+            // Poll generation status - SSE handles queue and library updates
+            const genResponse = await fetch(`/api/generation/${id}`);
 
             if (!genResponse.ok) {
                 // 404 means generation doesn't exist - stop polling
@@ -607,65 +671,7 @@ var App = () => {
         } catch (e) { console.error(e); }
     }, [cleanupGeneration]);
 
-    // Idle polling - checks for server-started generations (e.g. from queue)
-    // This runs when no generation is being tracked by this client
-    const idlePoll = useCallback(async () => {
-        try {
-            const [queueResponse, libraryResponse] = await Promise.all([
-                fetch('/api/queue'),
-                fetch('/api/generations')
-            ]);
-
-            // Update queue from server
-            if (queueResponse.ok) {
-                const queueData = await queueResponse.json();
-                setQueue(queueData);
-            }
-
-            // Check library for any active generations
-            if (libraryResponse.ok) {
-                const libraryData = await libraryResponse.json();
-                setLibrary(libraryData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
-
-                // Look for any active generation we should track
-                const activeGen = libraryData.find(g => g.status === 'pending' || g.status === 'processing');
-                if (activeGen && !currentGenId) {
-                    console.log(`[IdlePoll] Found active generation: ${activeGen.id} (${activeGen.status})`);
-                    // Stop idle polling and start tracking this generation
-                    clearInterval(idlePollRef.current);
-                    idlePollRef.current = null;
-                    setCurrentGenId(activeGen.id);
-                    setCurrentGenPayload({ title: activeGen.title });
-                    setGenerating(true);
-                    setProgress(activeGen.progress || 0);
-                    setStatus(activeGen.message || 'Processing...');
-                    // Start regular polling for this generation
-                    pollRef.current = setInterval(() => poll(activeGen.id), 2000);
-                }
-            }
-        } catch (e) {
-            console.error('[IdlePoll] Error:', e);
-        }
-    }, [currentGenId, poll]);
-
-    // Start idle polling (called when generation ends or when conflict detected)
-    const startIdlePolling = useCallback(() => {
-        if (idlePollRef.current) return;  // Already polling
-        console.log('[IdlePoll] Starting idle polling');
-        // Poll immediately once
-        idlePoll();
-        // Then poll every 3 seconds
-        idlePollRef.current = setInterval(idlePoll, 3000);
-    }, [idlePoll]);
-
-    // Stop idle polling
-    const stopIdlePolling = useCallback(() => {
-        if (idlePollRef.current) {
-            console.log('[IdlePoll] Stopping idle polling');
-            clearInterval(idlePollRef.current);
-            idlePollRef.current = null;
-        }
-    }, []);
+    // NOTE: idlePoll, startIdlePolling, stopIdlePolling removed - SSE handles real-time updates now
 
     const createPayload = () => ({
         title,
@@ -722,8 +728,9 @@ var App = () => {
             // Handle 409 conflict - another generation is already running
             if (e.message.includes('409') || e.message.includes('already in progress')) {
                 console.log('Generation conflict - server already running a generation');
-                // Start idle polling to track the server's generation
-                startIdlePolling();
+                // SSE will automatically detect and track the server's generation
+                // Just refresh library to show current state
+                loadLibrary();
             } else {
                 setError(e.message);
             }
@@ -1919,18 +1926,28 @@ var App = () => {
             }}>
                 {/* Song Info */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: '200px', maxWidth: '300px' }}>
-                    <div style={{
-                        width: '48px',
-                        height: '48px',
-                        borderRadius: '6px',
-                        backgroundColor: activityPlayingItem ? '#10B981' : '#3a3a3a',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        flexShrink: 0,
-                    }}>
-                        <MusicNoteIcon size={20} color={activityPlayingItem ? '#fff' : '#666'} />
-                    </div>
+                    {(() => {
+                        const playerCoverUrl = activityPlayingItem?.metadata?.cover
+                            ? `/api/generation/${activityPlayingItem.id}/cover?v=${activityPlayingItem.metadata.cover}`
+                            : null;
+                        return (
+                            <div style={{
+                                width: '48px',
+                                height: '48px',
+                                borderRadius: '6px',
+                                backgroundColor: activityPlayingItem ? (playerCoverUrl ? 'transparent' : '#10B981') : '#3a3a3a',
+                                backgroundImage: playerCoverUrl ? `url(${playerCoverUrl})` : 'none',
+                                backgroundSize: 'cover',
+                                backgroundPosition: 'center',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                flexShrink: 0,
+                            }}>
+                                {!playerCoverUrl && <MusicNoteIcon size={20} color={activityPlayingItem ? '#fff' : '#666'} />}
+                            </div>
+                        );
+                    })()}
                     <div style={{ overflow: 'hidden' }}>
                         <div style={{ fontSize: '13px', fontWeight: '500', color: activityPlayingItem ? '#fff' : '#666', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                             {activityPlayingItem ? (activityPlayingItem.metadata?.title || 'Untitled') : 'No song selected'}

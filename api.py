@@ -16,13 +16,15 @@ import subprocess
 import shutil
 import threading
 import time
+import queue as queue_module
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -225,8 +227,9 @@ def get_model_status(model_id: str) -> str:
             expected_size = expected_sizes.get('model.pt', 0)
 
             if expected_size > 0:
-                # We have exact expected size - compare exactly
-                if actual_size == expected_size:
+                # We have expected size from HuggingFace - allow 0.1% tolerance for minor variations
+                size_diff_pct = abs(actual_size - expected_size) / expected_size * 100
+                if size_diff_pct < 0.1:  # Within 0.1% is considered ready
                     return "ready"
                 else:
                     actual_gb = actual_size / (1024 * 1024 * 1024)
@@ -235,13 +238,14 @@ def get_model_status(model_id: str) -> str:
                     print(f"[MODEL] {model_id}/model.pt incomplete: {actual_size:,} / {expected_size:,} bytes ({pct:.1f}%) - {actual_gb:.2f}GB / {expected_gb:.2f}GB")
             else:
                 # No expected size from HuggingFace - fallback to registry size
+                # Note: registry size_gb is in decimal GB (1000^3), not binary GiB (1024^3)
                 expected_size_gb = MODEL_REGISTRY[model_id]["size_gb"]
-                # Allow 1% tolerance for fallback (might have slight differences)
-                min_required_bytes = int(expected_size_gb * 0.99 * 1024 * 1024 * 1024)
+                # Allow 5% tolerance for fallback (might have slight differences)
+                min_required_bytes = int(expected_size_gb * 0.95 * 1000 * 1000 * 1000)
                 if actual_size >= min_required_bytes:
                     return "ready"
                 else:
-                    actual_gb = actual_size / (1024 * 1024 * 1024)
+                    actual_gb = actual_size / (1000 * 1000 * 1000)
                     print(f"[MODEL] {model_id}/model.pt incomplete (fallback check): {actual_gb:.2f}GB / {expected_size_gb}GB expected")
 
         except (OSError, IOError) as e:
@@ -254,12 +258,15 @@ def get_model_status(model_id: str) -> str:
             actual_size = model_file_st.stat().st_size
             expected_size = expected_sizes.get('model.safetensors', 0)
 
-            if expected_size > 0 and actual_size == expected_size:
-                return "ready"
-            elif expected_size == 0:
-                # Fallback
+            if expected_size > 0:
+                # Allow 0.1% tolerance
+                size_diff_pct = abs(actual_size - expected_size) / expected_size * 100
+                if size_diff_pct < 0.1:
+                    return "ready"
+            else:
+                # Fallback - use decimal GB
                 expected_size_gb = MODEL_REGISTRY[model_id]["size_gb"]
-                min_required_bytes = int(expected_size_gb * 0.99 * 1024 * 1024 * 1024)
+                min_required_bytes = int(expected_size_gb * 0.95 * 1000 * 1000 * 1000)
                 if actual_size >= min_required_bytes:
                     return "ready"
         except (OSError, IOError):
@@ -837,18 +844,31 @@ async def process_queue_item():
     with generation_lock:
         # Double-check no generation is active
         if is_generation_active():
-            print("[QUEUE-PROC] Skipping - generation already active")
+            print("[QUEUE-PROC] Skipping - generation already active", flush=True)
             return
 
         queue = load_queue()
         if not queue:
-            print("[QUEUE-PROC] Queue is empty")
+            print("[QUEUE-PROC] Queue is empty", flush=True)
             return
 
         # Pop the next item
         item = queue.pop(0)
         save_queue(queue)
-        print(f"[QUEUE-PROC] Auto-starting next item: {item.get('title', 'Untitled')}")
+        print(f"[QUEUE-PROC] Auto-starting next item: {item.get('title', 'Untitled')}", flush=True)
+
+        # Notify clients that queue changed
+        notify_queue_update()
+
+        # Validate model exists before processing
+        model_id = item.get('model') or DEFAULT_MODEL
+        model_status = get_model_status(model_id)
+        if model_status != "ready":
+            print(f"[QUEUE-PROC] Skipping item - model not ready: {model_id} (status: {model_status})", flush=True)
+            # Re-add item to front of queue so it can be retried
+            queue.insert(0, item)
+            save_queue(queue)
+            return
 
         # Create generation request from queue item
         gen_id = str(uuid.uuid4())[:8]
@@ -880,7 +900,7 @@ async def process_queue_item():
                 extend_stride=item.get('extend_stride', 5),
             )
         except Exception as e:
-            print(f"[QUEUE-PROC] Error creating request from queue item: {e}")
+            print(f"[QUEUE-PROC] Error creating request from queue item: {e}", flush=True)
             return
 
         # Handle reference audio
@@ -906,13 +926,14 @@ async def process_queue_item():
 
     # Run generation outside the lock
     # Since this function is now async, we can directly await run_generation
-    print(f"[QUEUE-PROC] Starting generation: {gen_id}")
+    print(f"[QUEUE-PROC] Starting generation: {gen_id}", flush=True)
     try:
         await run_generation(gen_id, request, reference_path)
     except Exception as e:
-        print(f"[QUEUE-PROC] Error running generation: {e}")
+        print(f"[QUEUE-PROC] Error running generation: {e}", flush=True)
         import traceback
         traceback.print_exc()
+        sys.stdout.flush()
         generations[gen_id]["status"] = "failed"
         generations[gen_id]["message"] = str(e)
 
@@ -1002,10 +1023,119 @@ def restore_library():
 restore_library()
 
 # ============================================================================
-# FastAPI App
+# Server-Sent Events (SSE) for Real-time Updates
 # ============================================================================
 
-app = FastAPI(title="SongGeneration Studio", version="1.0.0")
+# SSE clients - each client gets their own queue for events
+sse_clients: List[queue_module.Queue] = []
+sse_lock = threading.Lock()
+
+def broadcast_event(event_type: str, data: dict):
+    """Broadcast an event to all connected SSE clients."""
+    event_data = json.dumps({"type": event_type, **data})
+    message = f"event: {event_type}\ndata: {event_data}\n\n"
+
+    with sse_lock:
+        dead_clients = []
+        for client_queue in sse_clients:
+            try:
+                client_queue.put_nowait(message)
+            except queue_module.Full:
+                dead_clients.append(client_queue)
+        # Remove dead clients
+        for dead in dead_clients:
+            sse_clients.remove(dead)
+
+def notify_queue_update():
+    """Notify all clients that queue changed."""
+    broadcast_event("queue", {"queue": load_queue()})
+
+def notify_generation_update(gen_id: str, gen_data: dict):
+    """Notify all clients about generation status change."""
+    broadcast_event("generation", {"id": gen_id, "generation": gen_data})
+
+def notify_library_update():
+    """Notify all clients that library changed."""
+    # Send list of generation IDs and their statuses (not full data to keep message small)
+    summary = [{"id": g["id"], "status": g.get("status"), "progress": g.get("progress", 0)}
+               for g in generations.values()]
+    broadcast_event("library", {"generations": summary})
+
+# ============================================================================
+# Background Queue Processor
+# ============================================================================
+
+queue_processor_running = False
+queue_processor_task = None
+
+async def background_queue_processor():
+    """Background task that continuously monitors and processes the queue.
+
+    This runs as a persistent background task, checking for queue items
+    and processing them when no generation is active.
+    """
+    global queue_processor_running
+    queue_processor_running = True
+    print("[QUEUE-WORKER] Background queue processor started", flush=True)
+
+    while queue_processor_running:
+        try:
+            # Check if there's work to do
+            if not is_generation_active():
+                queue = load_queue()
+                if queue:
+                    print(f"[QUEUE-WORKER] Found {len(queue)} item(s), processing next...", flush=True)
+                    await process_queue_item()
+
+            # Sleep briefly before checking again
+            await asyncio.sleep(2.0)
+
+        except asyncio.CancelledError:
+            print("[QUEUE-WORKER] Cancelled, shutting down...", flush=True)
+            break
+        except Exception as e:
+            print(f"[QUEUE-WORKER] Error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            # Continue running even after errors
+            await asyncio.sleep(5.0)
+
+    print("[QUEUE-WORKER] Background queue processor stopped", flush=True)
+
+# ============================================================================
+# FastAPI App with Lifespan
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app):
+    """Application lifespan handler - runs on startup and shutdown."""
+    global queue_processor_task
+
+    # Startup: Start the background queue processor
+    print("[STARTUP] Starting background queue processor...", flush=True)
+    queue_processor_task = asyncio.create_task(background_queue_processor())
+
+    queue = load_queue()
+    if queue:
+        print(f"[STARTUP] {len(queue)} item(s) in queue, will be processed automatically", flush=True)
+    else:
+        print("[STARTUP] Queue is empty", flush=True)
+    sys.stdout.flush()
+
+    yield  # App runs here
+
+    # Shutdown: Stop background processor
+    global queue_processor_running
+    queue_processor_running = False
+    if queue_processor_task:
+        queue_processor_task.cancel()
+        try:
+            await queue_processor_task
+        except asyncio.CancelledError:
+            pass
+    print("[SHUTDOWN] Server shutting down...", flush=True)
+
+app = FastAPI(title="SongGeneration Studio", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1099,6 +1229,10 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         generations[gen_id]["started_at"] = datetime.now().isoformat()  # Track actual start time
         generations[gen_id]["message"] = "Preparing input..."
         generations[gen_id]["progress"] = 5
+
+        # Notify clients of status change
+        notify_generation_update(gen_id, generations[gen_id])
+        notify_library_update()
 
         # Validate model
         model_id = request.model or DEFAULT_MODEL
@@ -1289,6 +1423,9 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
                             pct = int(match.group(1))
                             progress = min(95, 20 + (pct * 0.75))
                             generations[gen_id]["progress"] = progress
+                            # Notify clients of progress (throttled - only every 5%)
+                            if pct % 5 == 0:
+                                notify_generation_update(gen_id, generations[gen_id])
             except asyncio.TimeoutError:
                 # Timeout on readline, just continue to check for stop
                 continue
@@ -1312,6 +1449,9 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
             generations[gen_id]["status"] = "stopped"
             generations[gen_id]["message"] = "Generation stopped by user"
             input_file.unlink(missing_ok=True)
+            # Notify clients
+            notify_generation_update(gen_id, generations[gen_id])
+            notify_library_update()
             return
 
         await process.wait()
@@ -1402,6 +1542,10 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
 
         input_file.unlink(missing_ok=True)
 
+        # Notify clients of completion
+        notify_generation_update(gen_id, generations[gen_id])
+        notify_library_update()
+
     except Exception as e:
         print(f"[GEN {gen_id}] ERROR: {e}")
         import traceback
@@ -1409,13 +1553,11 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         generations[gen_id]["status"] = "failed"
         generations[gen_id]["message"] = str(e)
 
-    # Auto-process next item in queue (runs in same async context)
-    # Use a finally-like approach - always try to process queue after generation ends
-    try:
-        print(f"[GEN {gen_id}] Generation ended, checking queue...")
-        await process_queue_item()
-    except Exception as queue_err:
-        print(f"[GEN {gen_id}] Error processing queue: {queue_err}")
+        # Notify clients of failure
+        notify_generation_update(gen_id, generations[gen_id])
+        notify_library_update()
+
+    # Background queue processor will automatically handle the next item
 
 # ============================================================================
 # API Routes
@@ -1568,6 +1710,13 @@ async def get_reference_audio(ref_id: str):
 async def generate_song(request: SongRequest, background_tasks: BackgroundTasks):
     """Start a new song generation."""
 
+    # Validate model exists BEFORE accepting request
+    model_id = request.model or DEFAULT_MODEL
+    model_status = get_model_status(model_id)
+    if model_status != "ready":
+        print(f"[API] Rejected generation - model not ready: {model_id} (status: {model_status})")
+        raise HTTPException(400, f"Model '{model_id}' is not downloaded. Please download the model first.")
+
     # Acquire lock to prevent race conditions between multiple clients
     with generation_lock:
         # Check if there's already an active generation
@@ -1652,6 +1801,10 @@ async def stop_generation(gen_id: str):
             running_processes[gen_id].terminate()
         except Exception as e:
             print(f"[API] Error terminating process: {e}")
+
+    # Notify clients
+    notify_generation_update(gen_id, generations[gen_id])
+    notify_library_update()
 
     return {"status": "stopped", "message": "Generation stop requested"}
 
@@ -1797,7 +1950,9 @@ async def upload_cover(gen_id: str, file: UploadFile = File(...)):
         except:
             pass
 
-    metadata["cover"] = f"cover{ext}"
+    # Use timestamp as cache buster (changes every upload, forcing browser to fetch new image)
+    cover_timestamp = int(time.time() * 1000)
+    metadata["cover"] = cover_timestamp
     with open(metadata_path, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
@@ -1805,10 +1960,10 @@ async def upload_cover(gen_id: str, file: UploadFile = File(...)):
     if gen_id in generations:
         if "metadata" not in generations[gen_id]:
             generations[gen_id]["metadata"] = {}
-        generations[gen_id]["metadata"]["cover"] = f"cover{ext}"
+        generations[gen_id]["metadata"]["cover"] = cover_timestamp
 
     print(f"[API] Uploaded cover for {gen_id}: {cover_path} ({len(content)} bytes)")
-    return {"status": "uploaded", "cover": f"cover{ext}"}
+    return {"status": "uploaded", "cover": cover_timestamp}
 
 @app.get("/api/generation/{gen_id}/cover")
 async def get_cover(gen_id: str):
@@ -1833,7 +1988,10 @@ async def get_cover(gen_id: str):
                 '.gif': 'image/gif',
                 '.webp': 'image/webp'
             }
-            return FileResponse(cover_path, media_type=media_types.get(ext, 'image/jpeg'))
+            response = FileResponse(cover_path, media_type=media_types.get(ext, 'image/jpeg'))
+            # Allow caching but require revalidation (URL has timestamp cache buster)
+            response.headers["Cache-Control"] = "public, max-age=31536000"
+            return response
 
     # Return 204 No Content instead of 404 to reduce log noise
     # Frontend handles missing covers gracefully
@@ -2231,6 +2389,13 @@ async def get_queue():
 @app.post("/api/queue")
 async def add_to_queue(payload: dict):
     """Add an item to the generation queue."""
+    # Validate model exists before adding to queue
+    model_id = payload.get('model') or DEFAULT_MODEL
+    model_status = get_model_status(model_id)
+    if model_status != "ready":
+        print(f"[QUEUE] Rejected - model not ready: {model_id} (status: {model_status})")
+        raise HTTPException(400, f"Model '{model_id}' is not downloaded. Please download the model first.")
+
     queue = load_queue()
     # Add unique ID and timestamp
     item = {
@@ -2241,6 +2406,10 @@ async def add_to_queue(payload: dict):
     queue.append(item)
     save_queue(queue)
     print(f"[QUEUE] Added item: {item.get('title', 'Untitled')}")
+
+    # Notify all clients
+    notify_queue_update()
+
     return {"status": "added", "item": item, "queue_length": len(queue)}
 
 @app.delete("/api/queue/{item_id}")
@@ -2252,6 +2421,7 @@ async def remove_from_queue(item_id: str):
     if len(queue) < original_len:
         save_queue(queue)
         print(f"[QUEUE] Removed item: {item_id}")
+        notify_queue_update()
         return {"status": "removed", "queue_length": len(queue)}
     raise HTTPException(404, "Item not found in queue")
 
@@ -2260,6 +2430,7 @@ async def clear_queue():
     """Clear the entire queue."""
     save_queue([])
     print("[QUEUE] Cleared queue")
+    notify_queue_update()
     return {"status": "cleared"}
 
 @app.post("/api/queue/next")
@@ -2282,7 +2453,66 @@ async def pop_queue():
         item = queue.pop(0)
         save_queue(queue)
         print(f"[QUEUE] Popped item: {item.get('title', 'Untitled')}")
+        notify_queue_update()
         return {"item": item, "remaining": len(queue)}
+
+# ============================================================================
+# Server-Sent Events (SSE) Endpoint
+# ============================================================================
+
+async def sse_event_generator(client_queue: queue_module.Queue):
+    """Generate SSE events for a connected client."""
+    try:
+        # Send initial state
+        yield f"event: connected\ndata: {json.dumps({'type': 'connected'})}\n\n"
+
+        # Send current queue
+        yield f"event: queue\ndata: {json.dumps({'type': 'queue', 'queue': load_queue()})}\n\n"
+
+        # Send current generations summary
+        summary = [{"id": g["id"], "status": g.get("status"), "progress": g.get("progress", 0)}
+                   for g in generations.values()]
+        yield f"event: library\ndata: {json.dumps({'type': 'library', 'generations': summary})}\n\n"
+
+        while True:
+            try:
+                # Wait for events with timeout
+                message = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: client_queue.get(timeout=30)
+                )
+                yield message
+            except queue_module.Empty:
+                # Send heartbeat to keep connection alive
+                yield f": heartbeat\n\n"
+    except asyncio.CancelledError:
+        pass
+    except GeneratorExit:
+        pass
+
+@app.get("/api/events")
+async def sse_endpoint():
+    """Server-Sent Events endpoint for real-time updates."""
+    client_queue = queue_module.Queue(maxsize=100)
+
+    with sse_lock:
+        sse_clients.append(client_queue)
+
+    async def cleanup():
+        with sse_lock:
+            if client_queue in sse_clients:
+                sse_clients.remove(client_queue)
+
+    response = StreamingResponse(
+        sse_event_generator(client_queue),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
+    response.background = cleanup
+    return response
 
 # Serve static files
 if STATIC_DIR.exists():
