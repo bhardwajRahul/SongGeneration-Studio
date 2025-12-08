@@ -12,11 +12,15 @@ import uuid
 import asyncio
 import re
 import argparse
+import subprocess
+import shutil
+import threading
+import time
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,52 +95,683 @@ DEFAULT_MODEL = "songgeneration_base"
 OUTPUT_DIR = BASE_DIR / "output"
 UPLOADS_DIR = BASE_DIR / "uploads"
 STATIC_DIR = BASE_DIR / "web" / "static"
+QUEUE_FILE = BASE_DIR / "queue.json"
 
 # Create directories
 OUTPUT_DIR.mkdir(exist_ok=True)
 UPLOADS_DIR.mkdir(exist_ok=True)
 (BASE_DIR / "web" / "static").mkdir(parents=True, exist_ok=True)
 
-def get_available_models() -> List[dict]:
-    """Detect available model folders in BASE_DIR."""
+# ============================================================================
+# Server-side Queue Storage
+# ============================================================================
+
+def load_queue() -> list:
+    """Load queue from file"""
+    try:
+        if QUEUE_FILE.exists():
+            with open(QUEUE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[QUEUE] Error loading queue: {e}")
+    return []
+
+def save_queue(queue: list):
+    """Save queue to file"""
+    try:
+        with open(QUEUE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(queue, f, indent=2)
+    except Exception as e:
+        print(f"[QUEUE] Error saving queue: {e}")
+
+# ============================================================================
+# Model Registry & Download Manager
+# ============================================================================
+
+MODEL_REGISTRY: Dict[str, dict] = {
+    "songgeneration_base": {
+        "name": "Base (2m30s)",
+        "description": "Chinese + English, 10GB VRAM, max 2m30s",
+        "vram_required": 10,
+        "hf_repo": "lglg666/SongGeneration-base",
+        "size_gb": 11.3,
+        "priority": 1,  # Lower = recommended first for lower VRAM
+    },
+    "songgeneration_base_new": {
+        "name": "Base New (2m30s)",
+        "description": "Updated base model, 10GB VRAM, max 2m30s",
+        "vram_required": 10,
+        "hf_repo": "lglg666/SongGeneration-base-new",
+        "size_gb": 11.3,
+        "priority": 2,
+    },
+    "songgeneration_base_full": {
+        "name": "Base Full (4m30s)",
+        "description": "Full duration up to 4m30s, 12GB VRAM",
+        "vram_required": 12,
+        "hf_repo": "lglg666/SongGeneration-base-full",
+        "size_gb": 11.3,
+        "priority": 3,
+    },
+    "songgeneration_large": {
+        "name": "Large (4m30s)",
+        "description": "Best quality, 22GB VRAM, max 4m30s",
+        "vram_required": 22,
+        "hf_repo": "lglg666/SongGeneration-large",
+        "size_gb": 20.5,
+        "priority": 4,
+    },
+}
+
+# Download state tracking
+download_states: Dict[str, dict] = {}
+download_threads: Dict[str, threading.Thread] = {}
+download_processes: Dict[str, subprocess.Popen] = {}  # Store subprocess for killing
+download_cancel_flags: Dict[str, threading.Event] = {}  # Use Event for thread-safe cancellation
+
+# Cache for expected file sizes from HuggingFace (model_id -> {filename: size_bytes})
+expected_file_sizes_cache: Dict[str, dict] = {}
+
+def get_expected_file_sizes(model_id: str) -> dict:
+    """Get expected file sizes for a model, using cache or fetching from HuggingFace.
+
+    Returns dict mapping filename -> size_in_bytes, or empty dict if unavailable.
+    """
+    global expected_file_sizes_cache
+
+    # Check cache first
+    if model_id in expected_file_sizes_cache:
+        return expected_file_sizes_cache[model_id]
+
+    # Get from HuggingFace API
+    if model_id not in MODEL_REGISTRY:
+        return {}
+
+    hf_repo = MODEL_REGISTRY[model_id]["hf_repo"]
+    file_sizes = get_repo_file_sizes_from_hf(hf_repo)
+
+    if file_sizes:
+        expected_file_sizes_cache[model_id] = file_sizes
+
+    return file_sizes
+
+def get_model_status(model_id: str) -> str:
+    """Get the status of a model: ready, downloading, not_downloaded
+
+    A model is only 'ready' if:
+    1. The folder exists
+    2. The model file (model.pt) exists
+    3. The model file size EXACTLY matches the expected size from HuggingFace
+    """
+    # Check if currently downloading
+    if model_id in download_states and download_states[model_id].get("status") == "downloading":
+        return "downloading"
+
+    folder_path = BASE_DIR / model_id
+    if not folder_path.exists():
+        return "not_downloaded"
+
+    if model_id not in MODEL_REGISTRY:
+        return "not_downloaded"
+
+    # Get expected file sizes from HuggingFace (cached)
+    expected_sizes = get_expected_file_sizes(model_id)
+
+    # Check model.pt specifically (the main model file)
+    model_file = folder_path / "model.pt"
+    if model_file.exists():
+        try:
+            actual_size = model_file.stat().st_size
+            expected_size = expected_sizes.get('model.pt', 0)
+
+            if expected_size > 0:
+                # We have exact expected size - compare exactly
+                if actual_size == expected_size:
+                    return "ready"
+                else:
+                    actual_gb = actual_size / (1024 * 1024 * 1024)
+                    expected_gb = expected_size / (1024 * 1024 * 1024)
+                    pct = (actual_size / expected_size) * 100 if expected_size else 0
+                    print(f"[MODEL] {model_id}/model.pt incomplete: {actual_size:,} / {expected_size:,} bytes ({pct:.1f}%) - {actual_gb:.2f}GB / {expected_gb:.2f}GB")
+            else:
+                # No expected size from HuggingFace - fallback to registry size
+                expected_size_gb = MODEL_REGISTRY[model_id]["size_gb"]
+                # Allow 1% tolerance for fallback (might have slight differences)
+                min_required_bytes = int(expected_size_gb * 0.99 * 1024 * 1024 * 1024)
+                if actual_size >= min_required_bytes:
+                    return "ready"
+                else:
+                    actual_gb = actual_size / (1024 * 1024 * 1024)
+                    print(f"[MODEL] {model_id}/model.pt incomplete (fallback check): {actual_gb:.2f}GB / {expected_size_gb}GB expected")
+
+        except (OSError, IOError) as e:
+            print(f"[MODEL] Error checking {model_id}/model.pt: {e}")
+
+    # Also check for safetensors format
+    model_file_st = folder_path / "model.safetensors"
+    if model_file_st.exists():
+        try:
+            actual_size = model_file_st.stat().st_size
+            expected_size = expected_sizes.get('model.safetensors', 0)
+
+            if expected_size > 0 and actual_size == expected_size:
+                return "ready"
+            elif expected_size == 0:
+                # Fallback
+                expected_size_gb = MODEL_REGISTRY[model_id]["size_gb"]
+                min_required_bytes = int(expected_size_gb * 0.99 * 1024 * 1024 * 1024)
+                if actual_size >= min_required_bytes:
+                    return "ready"
+        except (OSError, IOError):
+            pass
+
+    return "not_downloaded"
+
+def get_download_progress(model_id: str) -> dict:
+    """Get download progress for a model"""
+    if model_id not in download_states:
+        return {"status": "not_started", "progress": 0}
+    return download_states[model_id]
+
+def get_repo_file_sizes_from_hf(repo_id: str) -> dict:
+    """Get exact file sizes in bytes from HuggingFace API.
+
+    Returns dict mapping filename -> size_in_bytes
+    """
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        repo_info = api.repo_info(repo_id=repo_id, repo_type="model", files_metadata=True)
+
+        file_sizes = {}
+        total_bytes = 0
+        for sibling in repo_info.siblings:
+            if hasattr(sibling, 'size') and sibling.size:
+                # rfilename is the relative filename
+                filename = sibling.rfilename
+                size_bytes = sibling.size
+                file_sizes[filename] = size_bytes
+                total_bytes += size_bytes
+
+        file_sizes['__total__'] = total_bytes
+
+        # Log the main model file size
+        model_size = file_sizes.get('model.pt', 0)
+        if model_size:
+            print(f"[DOWNLOAD] HuggingFace API: {repo_id}/model.pt = {model_size:,} bytes ({model_size / (1024**3):.2f} GB)")
+        print(f"[DOWNLOAD] HuggingFace API: {repo_id} total = {total_bytes:,} bytes ({total_bytes / (1024**3):.2f} GB)")
+
+        return file_sizes
+    except Exception as e:
+        print(f"[DOWNLOAD] Could not get file sizes from HF API: {e}")
+        return {}
+
+def get_repo_size_from_hf(repo_id: str) -> float:
+    """Get total repository size from HuggingFace API in GB"""
+    file_sizes = get_repo_file_sizes_from_hf(repo_id)
+    total_bytes = file_sizes.get('__total__', 0)
+    return total_bytes / (1024 * 1024 * 1024) if total_bytes else 0
+
+def get_directory_size(path: Path) -> int:
+    """Get total size of all files in a directory in bytes"""
+    if not path.exists():
+        return 0
+    total = 0
+    try:
+        for f in path.rglob('*'):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except (OSError, IOError):
+                    pass
+    except Exception:
+        pass
+    return total
+
+def run_model_download(model_id: str):
+    """Run model download in background thread with robust progress tracking.
+
+    Uses file size polling instead of parsing stdout (much more reliable).
+    Stores subprocess reference for proper cancellation.
+    """
+    global download_states, download_cancel_flags, download_processes
+
+    if model_id not in MODEL_REGISTRY:
+        download_states[model_id] = {"status": "error", "error": "Unknown model"}
+        return
+
+    model_info = MODEL_REGISTRY[model_id]
+    hf_repo = model_info["hf_repo"]
+    local_dir = BASE_DIR / model_id
+
+    print(f"[DOWNLOAD] Starting download of {model_id} from {hf_repo}")
+
+    # Get exact file sizes from HuggingFace API (and cache them for later verification)
+    expected_sizes = get_expected_file_sizes(model_id)
+    total_bytes = expected_sizes.get('__total__', 0)
+    actual_size_gb = total_bytes / (1024 * 1024 * 1024) if total_bytes else 0
+
+    if actual_size_gb <= 0:
+        actual_size_gb = model_info["size_gb"]  # Fallback to registry value
+        print(f"[DOWNLOAD] Using fallback size: {actual_size_gb} GB")
+    else:
+        model_pt_size = expected_sizes.get('model.pt', 0)
+        if model_pt_size:
+            print(f"[DOWNLOAD] Expected model.pt: {model_pt_size:,} bytes ({model_pt_size / (1024**3):.2f} GB)")
+
+    # Initialize download state
+    download_states[model_id] = {
+        "status": "downloading",
+        "progress": 0,
+        "downloaded_gb": 0,
+        "total_gb": round(actual_size_gb, 2),
+        "speed_mbps": 0,
+        "eta_seconds": 0,
+        "started_at": time.time(),
+    }
+
+    # Create cancellation event
+    cancel_event = threading.Event()
+    download_cancel_flags[model_id] = cancel_event
+
+    process = None
+    try:
+        # Start download subprocess
+        cmd = [
+            sys.executable, "-m", "huggingface_hub.commands.huggingface_cli",
+            "download", hf_repo,
+            "--local-dir", str(local_dir),
+            "--local-dir-use-symlinks", "False"
+        ]
+
+        # On Windows, use CREATE_NEW_PROCESS_GROUP for proper termination
+        creationflags = 0
+        if sys.platform == 'win32':
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+            creationflags=creationflags
+        )
+
+        # Store process reference for cancellation
+        download_processes[model_id] = process
+
+        print(f"[DOWNLOAD] Started subprocess PID {process.pid}")
+
+        # Progress tracking via file size polling
+        total_bytes = int(actual_size_gb * 1024 * 1024 * 1024)
+        last_downloaded = 0
+        last_time = time.time()
+        poll_interval = 1.0  # Poll every second
+
+        while process.poll() is None:
+            # Check for cancellation
+            if cancel_event.is_set():
+                print(f"[DOWNLOAD] Cancel requested for {model_id}")
+                try:
+                    if sys.platform == 'win32':
+                        # On Windows, use taskkill for reliable termination
+                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                                      capture_output=True, timeout=10)
+                    else:
+                        process.terminate()
+                        process.wait(timeout=5)
+                except Exception as e:
+                    print(f"[DOWNLOAD] Error terminating process: {e}")
+                    try:
+                        process.kill()
+                    except:
+                        pass
+
+                download_states[model_id] = {"status": "cancelled", "progress": 0}
+
+                # Clean up partial download
+                if local_dir.exists():
+                    print(f"[DOWNLOAD] Cleaning up partial download at {local_dir}")
+                    shutil.rmtree(local_dir, ignore_errors=True)
+                return
+
+            # Poll file sizes for progress
+            current_time = time.time()
+            current_downloaded = get_directory_size(local_dir)
+
+            # Calculate progress
+            if total_bytes > 0:
+                progress = min(99, int((current_downloaded / total_bytes) * 100))
+            else:
+                progress = 0
+
+            downloaded_gb = current_downloaded / (1024 * 1024 * 1024)
+
+            # Calculate speed (MB/s)
+            time_diff = current_time - last_time
+            if time_diff > 0:
+                bytes_diff = current_downloaded - last_downloaded
+                speed_mbps = (bytes_diff / time_diff) / (1024 * 1024)
+
+                # Calculate ETA
+                if speed_mbps > 0:
+                    remaining_bytes = total_bytes - current_downloaded
+                    eta_seconds = remaining_bytes / (speed_mbps * 1024 * 1024)
+                else:
+                    eta_seconds = 0
+
+                # Update state (check if still exists - cancel may have removed it)
+                if model_id in download_states:
+                    download_states[model_id].update({
+                        "progress": progress,
+                        "downloaded_gb": round(downloaded_gb, 2),
+                        "speed_mbps": round(speed_mbps, 1),
+                        "eta_seconds": int(eta_seconds),
+                    })
+
+            last_downloaded = current_downloaded
+            last_time = current_time
+
+            # Wait before next poll
+            time.sleep(poll_interval)
+
+        # Process finished - FIRST check if it was cancelled
+        # This handles the race condition where taskkill kills the process
+        # before we check cancel_event in the while loop
+        if cancel_event.is_set():
+            print(f"[DOWNLOAD] Download was cancelled for {model_id}")
+            # Cancel function may have already cleaned up - just exit
+            return
+
+        # Process finished naturally - check result
+        exit_code = process.returncode
+        print(f"[DOWNLOAD] Process finished with exit code {exit_code}")
+
+        # Read any remaining output for debugging
+        try:
+            stdout, _ = process.communicate(timeout=5)
+            if stdout:
+                output = stdout.decode('utf-8', errors='ignore')
+                if 'error' in output.lower() or 'exception' in output.lower():
+                    print(f"[DOWNLOAD] Process output: {output[-500:]}")
+        except:
+            pass
+
+        # Verify the download by checking EXACT file sizes
+        # Get expected sizes (should already be cached from start of download)
+        expected_sizes = get_expected_file_sizes(model_id)
+        expected_model_size = expected_sizes.get('model.pt', 0) or expected_sizes.get('model.safetensors', 0)
+
+        # Check if model file exists and has correct size
+        model_file = local_dir / "model.pt"
+        if not model_file.exists():
+            model_file = local_dir / "model.safetensors"
+
+        download_complete = False
+        actual_model_size = 0
+
+        if model_file.exists():
+            try:
+                actual_model_size = model_file.stat().st_size
+                if expected_model_size > 0:
+                    # Exact comparison
+                    download_complete = (actual_model_size == expected_model_size)
+                    if download_complete:
+                        print(f"[DOWNLOAD] Verified: {model_file.name} = {actual_model_size:,} bytes (exact match)")
+                    else:
+                        pct = (actual_model_size / expected_model_size) * 100
+                        print(f"[DOWNLOAD] Size mismatch: {actual_model_size:,} / {expected_model_size:,} bytes ({pct:.1f}%)")
+                else:
+                    # Fallback: check if size is reasonable (at least 99% of registry size)
+                    expected_size_gb = model_info["size_gb"]
+                    min_bytes = int(expected_size_gb * 0.99 * 1024 * 1024 * 1024)
+                    download_complete = (actual_model_size >= min_bytes)
+            except (OSError, IOError) as e:
+                print(f"[DOWNLOAD] Error checking model file: {e}")
+
+        final_size = get_directory_size(local_dir)
+        final_gb = final_size / (1024 * 1024 * 1024)
+
+        if download_complete:
+            print(f"[DOWNLOAD] Completed: {final_gb:.2f} GB downloaded, model file verified")
+
+            download_states[model_id] = {
+                "status": "completed",
+                "progress": 100,
+                "downloaded_gb": round(final_gb, 2),
+                "total_gb": round(actual_size_gb, 2),
+            }
+            print(f"[DOWNLOAD] Successfully downloaded {model_id}")
+
+            # Update cache with verified sizes
+            expected_file_sizes_cache[model_id] = expected_sizes
+        else:
+            # Download failed or incomplete
+            actual_gb = actual_model_size / (1024 * 1024 * 1024) if actual_model_size else 0
+            expected_gb = expected_model_size / (1024 * 1024 * 1024) if expected_model_size else actual_size_gb
+
+            download_states[model_id] = {
+                "status": "error",
+                "error": f"Download incomplete: model.pt is {actual_model_size:,} bytes, expected {expected_model_size:,} bytes",
+                "progress": download_states[model_id].get("progress", 0) if model_id in download_states else 0,
+            }
+            print(f"[DOWNLOAD] Failed: {model_id} model file is {actual_gb:.2f}GB, expected {expected_gb:.2f}GB")
+
+            # Clean up incomplete download
+            if local_dir.exists() and final_gb < 0.5:  # Less than 500MB
+                print(f"[DOWNLOAD] Cleaning up failed download at {local_dir}")
+                try:
+                    shutil.rmtree(local_dir, ignore_errors=True)
+                except:
+                    pass
+
+    except Exception as e:
+        print(f"[DOWNLOAD] Error downloading {model_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        download_states[model_id] = {"status": "error", "error": str(e)}
+    finally:
+        # Cleanup
+        download_cancel_flags.pop(model_id, None)
+        download_processes.pop(model_id, None)
+        download_threads.pop(model_id, None)
+
+# Lock to prevent race conditions when starting downloads
+download_start_lock = threading.Lock()
+
+def start_model_download(model_id: str) -> dict:
+    """Start downloading a model in the background"""
+    if model_id not in MODEL_REGISTRY:
+        print(f"[DOWNLOAD] Rejected: unknown model {model_id}")
+        return {"error": "Unknown model"}
+
+    # Use lock to prevent race condition between check and start
+    with download_start_lock:
+        current_status = get_model_status(model_id)
+        if current_status == "ready":
+            print(f"[DOWNLOAD] Rejected: {model_id} already downloaded")
+            return {"error": "Model already downloaded"}
+        if current_status == "downloading":
+            print(f"[DOWNLOAD] Rejected: {model_id} is already downloading")
+            return {"error": "Model is already downloading"}
+
+        print(f"[DOWNLOAD] Starting download for {model_id}")
+
+        # Set download state IMMEDIATELY to prevent race conditions
+        # This ensures concurrent requests will see "downloading" status
+        download_states[model_id] = {
+            "status": "downloading",
+            "progress": 0,
+            "speed": None,
+            "eta": None,
+            "message": "Initializing download..."
+        }
+
+        # Start download thread (cancel flag will be created in run_model_download)
+        thread = threading.Thread(target=run_model_download, args=(model_id,), daemon=True)
+        download_threads[model_id] = thread
+        thread.start()
+
+    return {"status": "started", "model_id": model_id}
+
+def cancel_model_download(model_id: str) -> dict:
+    """Cancel an ongoing download"""
+    # Check if there's an active download
+    if model_id not in download_states or download_states[model_id].get("status") != "downloading":
+        return {"error": "No active download for this model"}
+
+    print(f"[DOWNLOAD] Cancel requested for {model_id}")
+
+    # Signal the download thread to stop
+    if model_id in download_cancel_flags:
+        download_cancel_flags[model_id].set()
+
+    # Kill the process directly for immediate effect
+    if model_id in download_processes:
+        process = download_processes[model_id]
+        try:
+            if sys.platform == 'win32':
+                # On Windows, use taskkill to kill the entire process tree
+                result = subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                                       capture_output=True, timeout=10)
+                print(f"[DOWNLOAD] taskkill result: {result.returncode}")
+            else:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        except Exception as e:
+            print(f"[DOWNLOAD] Error killing process: {e}")
+            try:
+                process.kill()
+            except:
+                pass
+
+    # Immediately set state to cancelled (don't wait for thread)
+    download_states[model_id] = {"status": "cancelled", "progress": 0}
+
+    # Clean up partial download immediately
+    local_dir = BASE_DIR / model_id
+    if local_dir.exists():
+        print(f"[DOWNLOAD] Cleaning up partial download at {local_dir}")
+        try:
+            shutil.rmtree(local_dir, ignore_errors=True)
+        except Exception as e:
+            print(f"[DOWNLOAD] Cleanup error: {e}")
+
+    # Clean up tracking state
+    download_processes.pop(model_id, None)
+    download_threads.pop(model_id, None)
+    # Remove from download_states entirely so get_model_status returns clean state
+    download_states.pop(model_id, None)
+
+    print(f"[DOWNLOAD] Cancelled and cleaned up {model_id}")
+    return {"status": "cancelled", "model_id": model_id}
+
+def delete_model(model_id: str) -> dict:
+    """Delete a downloaded model"""
+    if model_id not in MODEL_REGISTRY:
+        return {"error": "Unknown model"}
+
+    status = get_model_status(model_id)
+    if status == "downloading":
+        return {"error": "Cannot delete model while downloading. Cancel first."}
+    if status == "not_downloaded":
+        return {"error": "Model is not downloaded"}
+
+    folder_path = BASE_DIR / model_id
+    try:
+        shutil.rmtree(folder_path)
+        print(f"[MODEL] Deleted model {model_id}")
+        return {"status": "deleted", "model_id": model_id}
+    except Exception as e:
+        return {"error": f"Failed to delete: {e}"}
+
+def get_recommended_model() -> Optional[str]:
+    """Get the recommended model based on available (free) VRAM, not total."""
+    global gpu_info
+    gpu_info = get_gpu_info()  # Refresh
+
+    if not gpu_info['available']:
+        # No GPU, recommend smallest model
+        return "songgeneration_base"
+
+    # Use FREE VRAM, not total - other apps may be using GPU memory
+    vram = gpu_info['gpu']['free_gb']
+    print(f"[MODEL] Recommending based on {vram}GB available VRAM")
+
+    # Find the best model that fits in available VRAM, prioritizing by quality (higher priority = better)
+    suitable_models = []
+    for model_id, info in MODEL_REGISTRY.items():
+        if info['vram_required'] <= vram:
+            suitable_models.append((model_id, info['priority']))
+
+    if not suitable_models:
+        return "songgeneration_base"  # Fallback
+
+    # Sort by priority (higher = better) and return the best one
+    suitable_models.sort(key=lambda x: x[1], reverse=True)
+    return suitable_models[0][0]
+
+def get_all_models() -> List[dict]:
+    """Get all models with their current status"""
     models = []
-    model_patterns = [
-        ("songgeneration_base", "Base (2m30s)", "Chinese + English, 10GB VRAM, max 2m30s"),
-        ("songgeneration_base_new", "Base New (2m30s)", "Updated base model, max 2m30s"),
-        ("songgeneration_base_full", "Base Full (4m30s)", "Full duration up to 4m30s, 12GB VRAM"),
-        ("songgeneration_large", "Large (4m30s)", "Best quality, 22GB VRAM, max 4m30s"),
-    ]
+    for model_id, info in MODEL_REGISTRY.items():
+        status = get_model_status(model_id)
+        model_data = {
+            "id": model_id,
+            "name": info["name"],
+            "description": info["description"],
+            "vram_required": info["vram_required"],
+            "size_gb": info["size_gb"],
+            "status": status,
+        }
 
-    for folder_name, display_name, description in model_patterns:
-        folder_path = BASE_DIR / folder_name
-        if folder_path.exists():
-            # Check for various model file patterns
-            has_model = (
-                (folder_path / "model.pt").exists() or
-                (folder_path / "model.safetensors").exists() or
-                any(folder_path.glob("*.pt")) or
-                any(folder_path.glob("*.safetensors")) or
-                any(folder_path.glob("*.bin")) or
-                (folder_path / "config.yaml").exists()  # Some models only have config
-            )
-            has_config = (folder_path / "config.yaml").exists()
+        # Add download progress if downloading
+        if status == "downloading":
+            progress = get_download_progress(model_id)
+            model_data.update({
+                "progress": progress.get("progress", 0),
+                "downloaded_gb": progress.get("downloaded_gb", 0),
+                "speed_mbps": progress.get("speed_mbps", 0),
+                "eta_seconds": progress.get("eta_seconds", 0),
+            })
 
-            if has_model or has_config:
-                models.append({
-                    "id": folder_name,
-                    "name": display_name,
-                    "description": description,
-                    "path": str(folder_path),
-                    "has_config": has_config,
-                    "status": "ready"
-                })
+        models.append(model_data)
 
     return models
 
-available_models = get_available_models()
+# Legacy function for compatibility
+def get_available_models() -> List[dict]:
+    """Get only ready models (for backwards compatibility)"""
+    return [m for m in get_all_models() if m["status"] == "ready"]
+
 print(f"[CONFIG] Base dir: {BASE_DIR}")
 print(f"[CONFIG] Output dir: {OUTPUT_DIR}")
-print(f"[CONFIG] Available models: {[m['id'] for m in available_models]}")
+
+# Cleanup stale download states on startup
+# These are in-memory only and should be empty, but clear just in case
+download_states.clear()
+download_threads.clear()
+download_processes.clear()
+download_cancel_flags.clear()
+print(f"[CONFIG] Cleared stale download states")
+
+# Clean up partial downloads (folders exist but model file is incomplete/missing)
+for model_id in MODEL_REGISTRY.keys():
+    folder_path = BASE_DIR / model_id
+    if folder_path.exists():
+        status = get_model_status(model_id)
+        if status == "not_downloaded":
+            # Folder exists but model is incomplete
+            print(f"[CONFIG] Found incomplete model folder: {model_id} - will need re-download")
+
+ready_models = get_available_models()
+print(f"[CONFIG] Available models: {[m['id'] for m in ready_models]}")
+if not ready_models:
+    recommended = get_recommended_model()
+    print(f"[CONFIG] No models downloaded. Recommended: {recommended}")
 
 # ============================================================================
 # Data Models
@@ -174,24 +809,130 @@ class SongRequest(BaseModel):
 
 generations: dict[str, dict] = {}
 running_processes: dict[str, asyncio.subprocess.Process] = {}  # Track running processes for stop functionality
+generation_lock = threading.Lock()  # Prevents multiple simultaneous generations
+
+def is_generation_active() -> bool:
+    """Check if there's currently an active generation running."""
+    for gen in generations.values():
+        if gen.get("status") in ("pending", "processing"):
+            return True
+    return False
+
+def get_active_generation_id() -> Optional[str]:
+    """Get the ID of the currently active generation, if any."""
+    for gen_id, gen in generations.items():
+        if gen.get("status") in ("pending", "processing"):
+            return gen_id
+    return None
+
+async def process_queue_item():
+    """Process the next item in the queue if no generation is active.
+
+    This function is called automatically when a generation completes.
+    Must be async because it calls run_generation which is async.
+    It runs in the same background thread as the generation.
+    """
+    global generations
+
+    with generation_lock:
+        # Double-check no generation is active
+        if is_generation_active():
+            print("[QUEUE-PROC] Skipping - generation already active")
+            return
+
+        queue = load_queue()
+        if not queue:
+            print("[QUEUE-PROC] Queue is empty")
+            return
+
+        # Pop the next item
+        item = queue.pop(0)
+        save_queue(queue)
+        print(f"[QUEUE-PROC] Auto-starting next item: {item.get('title', 'Untitled')}")
+
+        # Create generation request from queue item
+        gen_id = str(uuid.uuid4())[:8]
+
+        # Convert sections from dicts to Section objects
+        sections = [Section(type=s.get('type', 'verse'), lyrics=s.get('lyrics'))
+                    for s in item.get('sections', [{'type': 'verse'}])]
+
+        try:
+            request = SongRequest(
+                title=item.get('title', 'Untitled'),
+                sections=sections,
+                gender=item.get('gender', 'female'),
+                timbre=item.get('timbre', ''),
+                genre=item.get('genre', ''),
+                emotion=item.get('emotion', ''),
+                instruments=item.get('instruments', ''),
+                custom_style=item.get('custom_style'),
+                bpm=item.get('bpm', 120),
+                output_mode=item.get('output_mode', 'mixed'),
+                auto_prompt_type=item.get('auto_prompt_type'),
+                reference_audio_id=item.get('reference_audio_id'),
+                model=item.get('model', 'songgeneration_base'),
+                memory_mode=item.get('memory_mode', 'auto'),
+                cfg_coef=item.get('cfg_coef', 1.5),
+                temperature=item.get('temperature', 0.8),
+                top_k=item.get('top_k', 50),
+                top_p=item.get('top_p', 0.0),
+                extend_stride=item.get('extend_stride', 5),
+            )
+        except Exception as e:
+            print(f"[QUEUE-PROC] Error creating request from queue item: {e}")
+            return
+
+        # Handle reference audio
+        reference_path = None
+        if request.reference_audio_id:
+            ref_files = list(UPLOADS_DIR.glob(f"{request.reference_audio_id}_*"))
+            if ref_files:
+                reference_path = str(ref_files[0])
+
+        # Register the generation (still inside lock)
+        generations[gen_id] = {
+            "id": gen_id,
+            "title": request.title,
+            "model": request.model,
+            "status": "pending",
+            "progress": 0,
+            "message": "Starting from queue...",
+            "output_file": None,
+            "output_files": [],
+            "created_at": datetime.now().isoformat(),
+            "completed_at": None
+        }
+
+    # Run generation outside the lock
+    # Since this function is now async, we can directly await run_generation
+    print(f"[QUEUE-PROC] Starting generation: {gen_id}")
+    try:
+        await run_generation(gen_id, request, reference_path)
+    except Exception as e:
+        print(f"[QUEUE-PROC] Error running generation: {e}")
+        import traceback
+        traceback.print_exc()
+        generations[gen_id]["status"] = "failed"
+        generations[gen_id]["message"] = str(e)
 
 def restore_library():
     """Restore completed generations from output directory on startup."""
     global generations
     restored = 0
-    
+
     print(f"[LIBRARY] Scanning output directory: {OUTPUT_DIR}")
-    
+
     if not OUTPUT_DIR.exists():
         return
-    
+
     subdirs = list(OUTPUT_DIR.iterdir())
     for subdir in subdirs:
         if not subdir.is_dir():
             continue
-        
+
         gen_id = subdir.name
-        
+
         # Look for audio files
         audio_files = []
         for search_dir in [subdir, subdir / "audios"]:
@@ -199,12 +940,12 @@ def restore_library():
                 audio_files.extend(search_dir.glob("*.flac"))
                 audio_files.extend(search_dir.glob("*.wav"))
                 audio_files.extend(search_dir.glob("*.mp3"))
-        
+
         if not audio_files:
             continue
-        
+
         audio_files = sorted(set(audio_files))
-        
+
         # Look for metadata file
         metadata_path = subdir / "metadata.json"
         metadata = {}
@@ -214,7 +955,7 @@ def restore_library():
                     metadata = json.load(f)
             except Exception as e:
                 print(f"[LIBRARY] Error loading metadata for {gen_id}: {e}")
-        
+
         # Fallback dates
         try:
             file_mtime = datetime.fromtimestamp(audio_files[0].stat().st_mtime).isoformat()
@@ -254,7 +995,7 @@ def restore_library():
             }
         }
         restored += 1
-    
+
     print(f"[LIBRARY] Restored {restored} generation(s)")
 
 # Restore library on import
@@ -294,7 +1035,7 @@ def build_lyrics_string(sections: List[Section]) -> str:
 
 def build_description(request: SongRequest, exclude_genre: bool = False) -> str:
     """Build the description string for style control.
-    
+
     Args:
         request: The song request
         exclude_genre: If True, excludes genre from description (use when auto_prompt handles genre)
@@ -329,19 +1070,19 @@ def build_description(request: SongRequest, exclude_genre: bool = False) -> str:
 
 # Genre to auto_prompt_audio_type mapping
 GENRE_TO_AUTO_PROMPT = {
-    "pop": "Pop", 
-    "r&b": "R&B", 
+    "pop": "Pop",
+    "r&b": "R&B",
     "rnb": "R&B",
-    "dance": "Dance", 
-    "electronic": "Dance", 
+    "dance": "Dance",
+    "electronic": "Dance",
     "edm": "Dance",
-    "jazz": "Jazz", 
-    "folk": "Folk", 
+    "jazz": "Jazz",
+    "folk": "Folk",
     "acoustic": "Folk",
-    "rock": "Rock", 
-    "metal": "Metal", 
+    "rock": "Rock",
+    "metal": "Metal",
     "heavy metal": "Metal",
-    "reggae": "Reggae", 
+    "reggae": "Reggae",
     "chinese": "Chinese Style",
     "chinese style": "Chinese Style",
     "chinese tradition": "Chinese Tradition",
@@ -355,6 +1096,7 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
     try:
         print(f"[GEN {gen_id}] Starting generation...")
         generations[gen_id]["status"] = "processing"
+        generations[gen_id]["started_at"] = datetime.now().isoformat()  # Track actual start time
         generations[gen_id]["message"] = "Preparing input..."
         generations[gen_id]["progress"] = 5
 
@@ -384,16 +1126,16 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
 
         # =======================================================================
         # FIX: Style control logic
-        # The model documentation states: "Avoid providing both prompt_audio_path 
+        # The model documentation states: "Avoid providing both prompt_audio_path
         # and descriptions at the same time."
-        # 
+        #
         # The same applies to auto_prompt_audio_type - it loads pre-trained style
         # embeddings that can OVERRIDE text descriptions!
         #
         # Solution: Only use auto_prompt_audio_type when there are NO descriptions.
         # When descriptions are provided, let them control the style entirely.
         # =======================================================================
-        
+
         if reference_path:
             # User provided reference audio - use it exclusively
             input_data["prompt_audio_path"] = reference_path
@@ -401,7 +1143,7 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         else:
             # =======================================================================
             # STYLE CONTROL STRATEGY:
-            # 
+            #
             # The model works best with BOTH:
             # 1. auto_prompt_audio_type - loads pre-trained audio embeddings for the genre
             # 2. descriptions - text conditioning for gender, timbre, instruments, BPM
@@ -410,27 +1152,27 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
             # However, we want to also control gender/timbre/etc, so we use descriptions
             # BUT exclude the genre from descriptions to avoid conflict.
             # =======================================================================
-            
+
             # Determine auto_prompt_audio_type from genre
             auto_type = "Auto"  # Default
             genre_for_auto_prompt = None
-            
+
             if request.genre:
                 # Extract first genre from comma-separated list
                 first_genre = request.genre.split(',')[0].strip().lower()
                 if first_genre in GENRE_TO_AUTO_PROMPT:
                     auto_type = GENRE_TO_AUTO_PROMPT[first_genre]
                     genre_for_auto_prompt = first_genre
-            
+
             # Always set auto_prompt_audio_type - this provides the core musical style
             input_data["auto_prompt_audio_type"] = auto_type
             print(f"[GEN {gen_id}] Using auto_prompt_audio_type: {auto_type}")
-            
+
             # Build descriptions for OTHER attributes (gender, timbre, emotion, instruments, BPM)
             # Exclude genre if it's being handled by auto_prompt to avoid conflict
             exclude_genre = genre_for_auto_prompt is not None
             description = build_description(request, exclude_genre=exclude_genre)
-            
+
             if description:
                 input_data["descriptions"] = description
                 print(f"[GEN {gen_id}] Additional descriptions: {description}")
@@ -652,9 +1394,9 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
             }
             with open(metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
-            
+
             generations[gen_id]["metadata"] = metadata
-            
+
         except Exception as meta_err:
             print(f"[GEN {gen_id}] Warning: Could not save metadata: {meta_err}")
 
@@ -666,6 +1408,14 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         traceback.print_exc()
         generations[gen_id]["status"] = "failed"
         generations[gen_id]["message"] = str(e)
+
+    # Auto-process next item in queue (runs in same async context)
+    # Use a finally-like approach - always try to process queue after generation ends
+    try:
+        print(f"[GEN {gen_id}] Generation ended, checking queue...")
+        await process_queue_item()
+    except Exception as queue_err:
+        print(f"[GEN {gen_id}] Error processing queue: {queue_err}")
 
 # ============================================================================
 # API Routes
@@ -705,13 +1455,71 @@ async def get_gpu_status():
 
 @app.get("/api/models")
 async def list_models():
-    """List all available models."""
-    global available_models
-    available_models = get_available_models()
+    """List all models with their status (ready, downloading, not_downloaded)."""
+    all_models = get_all_models()
+    ready_models = [m for m in all_models if m["status"] == "ready"]
+    recommended = get_recommended_model()
+
     return {
-        "models": available_models,
-        "default": DEFAULT_MODEL
+        "models": all_models,
+        "ready_models": ready_models,
+        "default": ready_models[0]["id"] if ready_models else None,
+        "recommended": recommended,
+        "has_ready_model": len(ready_models) > 0,
     }
+
+@app.get("/api/models/recommend")
+async def recommend_model():
+    """Get the recommended model based on available VRAM."""
+    recommended = get_recommended_model()
+    model_info = MODEL_REGISTRY.get(recommended, {})
+    return {
+        "recommended": recommended,
+        "name": model_info.get("name", "Unknown"),
+        "description": model_info.get("description", ""),
+        "vram_required": model_info.get("vram_required", 0),
+        "size_gb": model_info.get("size_gb", 0),
+        "gpu": gpu_info,
+    }
+
+@app.post("/api/models/{model_id}/download")
+async def download_model(model_id: str):
+    """Start downloading a model."""
+    result = start_model_download(model_id)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+@app.get("/api/models/{model_id}/download/status")
+async def get_download_status(model_id: str):
+    """Get the download status and progress for a model."""
+    if model_id not in MODEL_REGISTRY:
+        raise HTTPException(404, "Unknown model")
+
+    status = get_model_status(model_id)
+    progress = get_download_progress(model_id)
+
+    return {
+        "model_id": model_id,
+        "status": status,
+        **progress
+    }
+
+@app.delete("/api/models/{model_id}/download")
+async def cancel_download(model_id: str):
+    """Cancel an ongoing model download."""
+    result = cancel_model_download(model_id)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+@app.delete("/api/models/{model_id}")
+async def remove_model(model_id: str):
+    """Delete a downloaded model to free up space."""
+    result = delete_model(model_id)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
 
 @app.post("/api/upload-reference")
 async def upload_reference(file: UploadFile = File(...)):
@@ -759,33 +1567,44 @@ async def get_reference_audio(ref_id: str):
 @app.post("/api/generate")
 async def generate_song(request: SongRequest, background_tasks: BackgroundTasks):
     """Start a new song generation."""
-    gen_id = str(uuid.uuid4())[:8]
 
-    print(f"[API] New generation request: {gen_id}")
-    print(f"[API] Title: {request.title}")
-    print(f"[API] Model: {request.model}")
-    print(f"[API] Sections: {len(request.sections)}")
-    print(f"[API] Style: {request.genre}, {request.emotion}, {request.timbre}, Voice: {request.gender}")
+    # Acquire lock to prevent race conditions between multiple clients
+    with generation_lock:
+        # Check if there's already an active generation
+        active_id = get_active_generation_id()
+        if active_id:
+            print(f"[API] Rejected generation request - already generating: {active_id}")
+            raise HTTPException(409, f"Generation already in progress: {active_id}")
 
-    reference_path = None
-    if request.reference_audio_id:
-        ref_files = list(UPLOADS_DIR.glob(f"{request.reference_audio_id}_*"))
-        if ref_files:
-            reference_path = str(ref_files[0])
+        gen_id = str(uuid.uuid4())[:8]
 
-    generations[gen_id] = {
-        "id": gen_id,
-        "title": request.title,
-        "model": request.model,
-        "status": "pending",
-        "progress": 0,
-        "message": "Queued for generation...",
-        "output_file": None,
-        "output_files": [],
-        "created_at": datetime.now().isoformat(),
-        "completed_at": None
-    }
+        print(f"[API] New generation request: {gen_id}")
+        print(f"[API] Title: {request.title}")
+        print(f"[API] Model: {request.model}")
+        print(f"[API] Sections: {len(request.sections)}")
+        print(f"[API] Style: {request.genre}, {request.emotion}, {request.timbre}, Voice: {request.gender}")
 
+        reference_path = None
+        if request.reference_audio_id:
+            ref_files = list(UPLOADS_DIR.glob(f"{request.reference_audio_id}_*"))
+            if ref_files:
+                reference_path = str(ref_files[0])
+
+        # Register generation INSIDE lock to prevent race
+        generations[gen_id] = {
+            "id": gen_id,
+            "title": request.title,
+            "model": request.model,
+            "status": "pending",
+            "progress": 0,
+            "message": "Queued for generation...",
+            "output_file": None,
+            "output_files": [],
+            "created_at": datetime.now().isoformat(),
+            "completed_at": None
+        }
+
+    # Start background task outside lock
     background_tasks.add_task(run_generation, gen_id, request, reference_path)
 
     return {"generation_id": gen_id}
@@ -795,7 +1614,21 @@ async def get_generation_status(gen_id: str):
     """Get the status of a generation."""
     if gen_id not in generations:
         raise HTTPException(404, "Generation not found")
-    return generations[gen_id]
+
+    gen = generations[gen_id].copy()  # Return a copy with additional computed fields
+
+    # Calculate elapsed_seconds from started_at (if processing/generating)
+    if gen.get("started_at"):
+        try:
+            started = datetime.fromisoformat(gen["started_at"])
+            elapsed = (datetime.now() - started).total_seconds()
+            gen["elapsed_seconds"] = int(elapsed)
+        except:
+            gen["elapsed_seconds"] = 0
+    else:
+        gen["elapsed_seconds"] = 0
+
+    return gen
 
 @app.post("/api/stop/{gen_id}")
 async def stop_generation(gen_id: str):
@@ -979,12 +1812,15 @@ async def upload_cover(gen_id: str, file: UploadFile = File(...)):
 
 @app.get("/api/generation/{gen_id}/cover")
 async def get_cover(gen_id: str):
-    """Get the album cover image for a generation."""
+    """Get the album cover image for a generation.
+    Returns 204 No Content if no cover exists (instead of 404 to reduce log noise).
+    """
     output_subdir = OUTPUT_DIR / gen_id
 
     # Check if generation exists (in memory or on disk)
     if gen_id not in generations and not output_subdir.exists():
-        raise HTTPException(404, "Generation not found")
+        # Return 204 for non-existent generations too (reduces 404 spam)
+        return Response(status_code=204)
 
     # Look for cover file
     for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
@@ -999,7 +1835,9 @@ async def get_cover(gen_id: str):
             }
             return FileResponse(cover_path, media_type=media_types.get(ext, 'image/jpeg'))
 
-    raise HTTPException(404, "No cover image found")
+    # Return 204 No Content instead of 404 to reduce log noise
+    # Frontend handles missing covers gracefully
+    return Response(status_code=204)
 
 @app.delete("/api/generation/{gen_id}/cover")
 async def delete_cover(gen_id: str):
@@ -1355,8 +2193,20 @@ async def get_audio_track(gen_id: str, track_idx: int, format: Optional[str] = N
 
 @app.get("/api/generations")
 async def list_generations():
-    """List all generations."""
-    return list(generations.values())
+    """List all generations with computed elapsed_seconds for running generations."""
+    result = []
+    for gen in generations.values():
+        gen_copy = gen.copy()
+        # Calculate elapsed_seconds for running generations
+        if gen_copy.get("status") in ("processing", "generating", "pending") and gen_copy.get("started_at"):
+            try:
+                started = datetime.fromisoformat(gen_copy["started_at"])
+                elapsed = (datetime.now() - started).total_seconds()
+                gen_copy["elapsed_seconds"] = int(elapsed)
+            except:
+                gen_copy["elapsed_seconds"] = 0
+        result.append(gen_copy)
+    return result
 
 @app.get("/api/presets")
 async def get_presets():
@@ -1368,6 +2218,71 @@ async def get_presets():
         "genders": ["female", "male"],
         "auto_prompts": ["Auto", "Pop", "Rock", "Metal", "Jazz", "Folk", "Dance", "R&B", "Reggae"]
     }
+
+# ============================================================================
+# Queue API - Server-side queue storage (shared across all clients)
+# ============================================================================
+
+@app.get("/api/queue")
+async def get_queue():
+    """Get the current generation queue."""
+    return load_queue()
+
+@app.post("/api/queue")
+async def add_to_queue(payload: dict):
+    """Add an item to the generation queue."""
+    queue = load_queue()
+    # Add unique ID and timestamp
+    item = {
+        "id": str(uuid.uuid4()),
+        "added_at": datetime.now().isoformat(),
+        **payload
+    }
+    queue.append(item)
+    save_queue(queue)
+    print(f"[QUEUE] Added item: {item.get('title', 'Untitled')}")
+    return {"status": "added", "item": item, "queue_length": len(queue)}
+
+@app.delete("/api/queue/{item_id}")
+async def remove_from_queue(item_id: str):
+    """Remove an item from the queue by ID."""
+    queue = load_queue()
+    original_len = len(queue)
+    queue = [item for item in queue if item.get("id") != item_id]
+    if len(queue) < original_len:
+        save_queue(queue)
+        print(f"[QUEUE] Removed item: {item_id}")
+        return {"status": "removed", "queue_length": len(queue)}
+    raise HTTPException(404, "Item not found in queue")
+
+@app.delete("/api/queue")
+async def clear_queue():
+    """Clear the entire queue."""
+    save_queue([])
+    print("[QUEUE] Cleared queue")
+    return {"status": "cleared"}
+
+@app.post("/api/queue/next")
+async def pop_queue():
+    """Get and remove the next item from the queue.
+
+    This endpoint also checks if there's an active generation to prevent
+    multiple clients from starting simultaneous generations.
+    """
+    with generation_lock:
+        # Check if there's already an active generation
+        active_id = get_active_generation_id()
+        if active_id:
+            print(f"[QUEUE] Rejected pop - generation active: {active_id}")
+            raise HTTPException(409, f"Generation already in progress: {active_id}")
+
+        queue = load_queue()
+        if not queue:
+            raise HTTPException(404, "Queue is empty")
+        item = queue.pop(0)
+        save_queue(queue)
+        print(f"[QUEUE] Popped item: {item.get('title', 'Untitled')}")
+        return {"item": item, "remaining": len(queue)}
 
 # Serve static files
 if STATIC_DIR.exists():

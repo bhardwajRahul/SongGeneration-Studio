@@ -29,6 +29,14 @@ var App = () => {
     const [showAdvanced, setShowAdvanced] = useState(false);
     const [models, setModels] = useState([]);
     const [selectedModel, setSelectedModel] = useState('songgeneration_base');
+    const [hasReadyModel, setHasReadyModel] = useState(false);  // Start false, assume no models until API responds
+    const [recommendedModel, setRecommendedModel] = useState(null);
+    const autoDownloadTriggeredRef = useRef(false);  // Use ref to avoid React 18 StrictMode double-render issues
+    const [downloadPolling, setDownloadPolling] = useState(false);
+    const [isInitializing, setIsInitializing] = useState(true);  // Track initial load state
+    const [autoDownloadStarting, setAutoDownloadStarting] = useState(false);  // Track auto-download in progress
+    const [showModelManager, setShowModelManager] = useState(false);
+    const [allModels, setAllModels] = useState([]);
     const [generating, setGenerating] = useState(false);
     const [progress, setProgress] = useState(0);
     const [status, setStatus] = useState('');
@@ -45,18 +53,14 @@ var App = () => {
     const [estimatedTime, setEstimatedTime] = useState(null);
     const [elapsedTime, setElapsedTime] = useState(0);
     const [gpuInfo, setGpuInfo] = useState(null);
-    // Queue system - persist to localStorage
-    const [queue, setQueue] = useState(() => {
-        try {
-            const saved = localStorage.getItem('songgen_queue');
-            return saved ? JSON.parse(saved) : [];
-        } catch { return []; }
-    });
+    // Queue system - server-side storage (shared across all clients)
+    const [queue, setQueue] = useState([]);
     const [currentGenId, setCurrentGenId] = useState(null);
     const [currentGenPayload, setCurrentGenPayload] = useState(null);
     const pollRef = useRef(null);
     const addBtnRef = useRef(null);
     const timerRef = useRef(null);
+    const idlePollRef = useRef(null);  // Polls for server-started generations when idle
 
     // Activity panel audio / Media player
     const [activityPlayingId, setActivityPlayingId] = useState(null);
@@ -73,16 +77,69 @@ var App = () => {
     const [rightHover, rightHoverHandlers] = useHover();
     const [libraryHover, libraryHoverHandlers] = useHover();
 
-    useEffect(() => { loadModels(); loadLibrary(); loadGpuInfo(); }, []);
+    // Load queue from server
+    const loadQueue = async () => {
+        try {
+            const r = await fetch('/api/queue');
+            if (r.ok) {
+                const data = await r.json();
+                setQueue(data);
+            }
+        } catch (e) { console.error('Error loading queue:', e); }
+    };
+
+    // Add item to server-side queue
+    const addToQueue = async (payload) => {
+        try {
+            const r = await fetch('/api/queue', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (r.ok) {
+                await loadQueue(); // Refresh queue from server
+            }
+        } catch (e) { console.error('Error adding to queue:', e); }
+    };
+
+    // Remove item from server-side queue
+    const removeFromQueue = async (itemId) => {
+        try {
+            await fetch(`/api/queue/${itemId}`, { method: 'DELETE' });
+            await loadQueue(); // Refresh queue from server
+        } catch (e) { console.error('Error removing from queue:', e); }
+    };
+
+    // NOTE: popFromQueue removed - queue processing is handled server-side
+
+    useEffect(() => { loadModels(true); loadLibrary(); loadGpuInfo(); loadQueue(); }, []);
     useEffect(() => () => {
         pollRef.current && clearInterval(pollRef.current);
         timerRef.current && clearInterval(timerRef.current);
     }, []);
 
-    // Persist queue to localStorage
+    // Poll for model download progress
     useEffect(() => {
-        localStorage.setItem('songgen_queue', JSON.stringify(queue));
-    }, [queue]);
+        if (!downloadPolling) return;
+        const interval = setInterval(() => {
+            loadModels();
+        }, 2000);
+        return () => clearInterval(interval);
+    }, [downloadPolling]);
+
+    // Periodic sync: poll queue and library to detect when other clients start/complete generations
+    // This ensures all browser windows stay in sync
+    useEffect(() => {
+        // Only poll when NOT currently tracking a generation (those have their own polling)
+        if (currentGenId) return;
+
+        const syncInterval = setInterval(async () => {
+            // Refresh queue and library to detect changes from other clients
+            await Promise.all([loadQueue(), loadLibrary()]);
+        }, 3000);  // Poll every 3 seconds
+
+        return () => clearInterval(syncInterval);
+    }, [currentGenId]);
 
     // Restore running generation on page load
     const restoredRef = useRef(false);
@@ -107,10 +164,20 @@ var App = () => {
             setStatus(runningGen.message || 'Generating...');
             setProgress(runningGen.progress || 0);
 
-            const startTime = runningGen.created_at ? new Date(runningGen.created_at).getTime() : Date.now();
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            setElapsedTime(elapsed);
-            setGenStartTime(startTime);
+            // Use server-provided elapsed_seconds if available, otherwise calculate from started_at
+            // The server's started_at is when processing began (not when queued)
+            if (typeof runningGen.elapsed_seconds === 'number') {
+                setElapsedTime(runningGen.elapsed_seconds);
+            } else if (runningGen.started_at) {
+                const startTime = new Date(runningGen.started_at).getTime();
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                setElapsedTime(Math.max(0, elapsed));
+            } else if (runningGen.created_at) {
+                // Fallback to created_at (less accurate)
+                const startTime = new Date(runningGen.created_at).getTime();
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                setElapsedTime(Math.max(0, elapsed));
+            }
 
             const sectionCount = typeof payload.sections === 'number' ? payload.sections : (Array.isArray(payload.sections) ? payload.sections.length : 5);
             const baseTime = MODEL_BASE_TIMES[payload.model] || 240;
@@ -120,35 +187,20 @@ var App = () => {
             if (timerRef.current) clearInterval(timerRef.current);
             if (pollRef.current) clearInterval(pollRef.current);
 
+            // Use server time as source of truth - poll updates elapsedTime from server's elapsed_seconds
+            // Local timer provides smooth increments between polls for better UX
             timerRef.current = setInterval(() => {
                 setElapsedTime(prev => prev + 1);
             }, 1000);
 
+            // Poll every 2 seconds - this syncs elapsed time from server
             pollRef.current = setInterval(() => poll(runningGen.id), 2000);
         }
     }, [library, generating, currentGenId]);
 
-    // Auto-start queue processing
-    const queueProcessedRef = useRef(false);
-    useEffect(() => {
-        if (!queueProcessedRef.current && queue.length > 0 && !generating && !currentGenId && library.length > 0) {
-            const hasRunning = library.some(item => item.status === 'generating' || item.status === 'processing');
-            if (hasRunning) return;
-
-            queueProcessedRef.current = true;
-            setTimeout(() => {
-                setQueue(prev => {
-                    if (prev.length > 0 && !generating) {
-                        const [next, ...rest] = prev;
-                        setGenerating(true);
-                        startGeneration(next);
-                        return rest;
-                    }
-                    return prev;
-                });
-            }, 500);
-        }
-    }, [queue, generating, currentGenId, library]);
+    // NOTE: Queue processing is now handled entirely server-side
+    // The server auto-starts the next queued item when a generation completes
+    // Clients detect new generations via the library polling in cleanupGeneration
 
     // Auto-set output mode based on lyrics presence
     useEffect(() => {
@@ -160,17 +212,23 @@ var App = () => {
         }
     }, [sections]);
 
-    // Auto-select best model based on available VRAM
+    // Auto-select best model based on available (free) VRAM
+    // Be conservative - only auto-select larger models if there's plenty of headroom
     useEffect(() => {
-        if (!gpuInfo?.gpu?.total_gb || models.length === 0) return;
-        const vram = gpuInfo.gpu.total_gb;
+        if (!gpuInfo?.gpu?.free_gb || models.length === 0) return;
+        const freeVram = gpuInfo.gpu.free_gb;
         let bestModel = 'songgeneration_base';
-        if (vram >= 22 && models.some(m => m.id === 'songgeneration_large')) {
+        // LARGE: needs 22GB high mode, 28GB with ref - require >22GB free
+        // FULL: needs 12GB high mode, 18GB with ref - require >18GB free
+        // NEW/BASE: needs 10GB, 16GB with ref - default choice
+        if (freeVram > 22 && models.some(m => m.id === 'songgeneration_large' && m.status === 'ready')) {
             bestModel = 'songgeneration_large';
-        } else if (vram >= 12 && models.some(m => m.id === 'songgeneration_base_full')) {
+        } else if (freeVram > 18 && models.some(m => m.id === 'songgeneration_base_full' && m.status === 'ready')) {
             bestModel = 'songgeneration_base_full';
-        } else if (models.some(m => m.id === 'songgeneration_base_new')) {
+        } else if (models.some(m => m.id === 'songgeneration_base_new' && m.status === 'ready')) {
             bestModel = 'songgeneration_base_new';
+        } else if (models.some(m => m.id === 'songgeneration_base' && m.status === 'ready')) {
+            bestModel = 'songgeneration_base';
         }
         setSelectedModel(bestModel);
     }, [gpuInfo, models]);
@@ -206,13 +264,113 @@ var App = () => {
         return () => document.removeEventListener('click', handleClick);
     }, [showAddMenu]);
 
-    const loadModels = async () => {
+    const loadModels = async (triggerAutoDownload = false) => {
         try {
+            console.log('[MODELS] Loading models, triggerAutoDownload:', triggerAutoDownload);
             const r = await fetch('/api/models');
             if (r.ok) {
                 const d = await r.json();
-                setModels(d.models || []);
+                console.log('[MODELS] API response:', { has_ready_model: d.has_ready_model, recommended: d.recommended, modelCount: d.models?.length });
+
+                const all = d.models || [];
+                const ready = d.ready_models || all.filter(m => m.status === 'ready');
+
+                setAllModels(all);
+                setModels(ready);
+                setHasReadyModel(d.has_ready_model);
+                setRecommendedModel(d.recommended);
+
                 if (d.default) setSelectedModel(d.default);
+
+                // Check if any models are downloading
+                const hasDownloading = all.some(m => m.status === 'downloading');
+                setDownloadPolling(hasDownloading);
+
+                // Auto-download recommended model on first launch if no models ready
+                // Don't auto-download if already downloading something
+                if (triggerAutoDownload && !d.has_ready_model && d.recommended && !autoDownloadTriggeredRef.current && !hasDownloading) {
+                    console.log('[AUTO-DOWNLOAD] Triggering download of recommended model:', d.recommended);
+                    autoDownloadTriggeredRef.current = true;  // Set ref immediately to prevent double-trigger
+                    setAutoDownloadStarting(true);  // Show immediate feedback in UI
+
+                    // Start download with error handling - inline to ensure it runs
+                    try {
+                        const downloadResult = await fetch(`/api/models/${d.recommended}/download`, { method: 'POST' });
+                        if (downloadResult.ok) {
+                            console.log('[AUTO-DOWNLOAD] Download started successfully');
+                            setDownloadPolling(true);
+                            setAutoDownloadStarting(false);
+                            loadModels();  // Refresh to show download progress
+                        } else {
+                            const errorText = await downloadResult.text();
+                            console.error('[AUTO-DOWNLOAD] Failed to start download:', errorText);
+                            autoDownloadTriggeredRef.current = false;  // Reset so user can try again
+                            setAutoDownloadStarting(false);
+                        }
+                    } catch (downloadError) {
+                        console.error('[AUTO-DOWNLOAD] Error starting download:', downloadError);
+                        autoDownloadTriggeredRef.current = false;  // Reset so user can try again
+                        setAutoDownloadStarting(false);
+                    }
+                } else if (triggerAutoDownload) {
+                    console.log('[AUTO-DOWNLOAD] Conditions not met:', {
+                        hasReadyModel: d.has_ready_model,
+                        recommended: d.recommended,
+                        alreadyTriggered: autoDownloadTriggeredRef.current,
+                        hasDownloading
+                    });
+                }
+
+                // Mark initialization complete after first load
+                setIsInitializing(false);
+            } else {
+                console.error('[MODELS] Failed to load models, status:', r.status);
+                setIsInitializing(false);
+            }
+        } catch (e) {
+            console.error('[MODELS] Error loading models:', e);
+            setIsInitializing(false);
+        }
+    };
+
+    const startModelDownload = async (modelId) => {
+        try {
+            const r = await fetch(`/api/models/${modelId}/download`, { method: 'POST' });
+            if (r.ok) {
+                setDownloadPolling(true);
+                loadModels();
+            }
+        } catch (e) { console.error(e); }
+    };
+
+    const cancelModelDownload = async (modelId) => {
+        try {
+            const r = await fetch(`/api/models/${modelId}/download`, { method: 'DELETE' });
+            if (r.ok) {
+                // Immediately update local state to show cancellation
+                setAllModels(prev => {
+                    const updated = prev.map(m =>
+                        m.id === modelId ? { ...m, status: 'not_downloaded', progress: 0 } : m
+                    );
+                    // Stop polling if no other downloads active
+                    const stillDownloading = updated.some(m => m.status === 'downloading');
+                    if (!stillDownloading) {
+                        setDownloadPolling(false);
+                    }
+                    return updated;
+                });
+            }
+            // Refresh from server to get accurate state
+            await loadModels();
+        } catch (e) { console.error(e); }
+    };
+
+    const deleteModel = async (modelId) => {
+        if (!confirm(`Delete model ${modelId}? This will free up disk space but you'll need to download it again to use it.`)) return;
+        try {
+            const r = await fetch(`/api/models/${modelId}`, { method: 'DELETE' });
+            if (r.ok) {
+                loadModels();
             }
         } catch (e) { console.error(e); }
     };
@@ -328,37 +486,119 @@ var App = () => {
     };
 
     // Cleanup helper for generation completion/failure
-    const cleanupGeneration = useCallback((processQueue = true) => {
+    // NOTE: Queue processing is now handled server-side to prevent race conditions
+    // when multiple browser clients are connected. The server auto-starts the next
+    // queued item when a generation completes.
+    const cleanupGeneration = useCallback(async () => {
         clearInterval(pollRef.current);
         clearInterval(timerRef.current);
+        clearInterval(idlePollRef.current);
+        idlePollRef.current = null;
         setCurrentGenId(null);
         setCurrentGenPayload(null);
         setGenStartTime(null);
         setEstimatedTime(null);
         setElapsedTime(0);
-        if (processQueue) {
-            setQueue(prev => {
-                if (prev.length > 0) {
-                    const [next, ...rest] = prev;
-                    setTimeout(() => startGeneration(next), 100);
-                    return rest;
+        setGenerating(false);
+
+        // IMPORTANT: Reset restoredRef so the useEffect can detect new server-started generations
+        restoredRef.current = false;
+
+        // Refresh library and queue from server
+        await loadLibrary();
+        await loadQueue();
+
+        // Start brief idle polling to detect server-started generations from queue
+        // The server may have already started the next generation
+        console.log('[Cleanup] Starting brief idle polling for server-started generations');
+        let pollCount = 0;
+        const maxPolls = 10; // Poll for up to 30 seconds (10 polls * 3 sec)
+
+        const checkForNewGen = async () => {
+            try {
+                const [queueRes, libRes] = await Promise.all([
+                    fetch('/api/queue'),
+                    fetch('/api/generations')
+                ]);
+
+                if (queueRes.ok) {
+                    setQueue(await queueRes.json());
                 }
-                setGenerating(false);
-                return prev;
-            });
+
+                if (libRes.ok) {
+                    const libData = await libRes.json();
+                    setLibrary(libData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+
+                    // Check if server started a new generation
+                    const activeGen = libData.find(g => g.status === 'pending' || g.status === 'processing');
+                    if (activeGen) {
+                        console.log(`[Cleanup] Found server-started generation: ${activeGen.id}`);
+                        clearInterval(idlePollRef.current);
+                        idlePollRef.current = null;
+                        // The existing useEffect will pick this up since we reset restoredRef
+                        return;
+                    }
+                }
+
+                pollCount++;
+                if (pollCount >= maxPolls) {
+                    console.log('[Cleanup] Idle polling complete - no new generation');
+                    clearInterval(idlePollRef.current);
+                    idlePollRef.current = null;
+                }
+            } catch (e) {
+                console.error('[Cleanup] Idle poll error:', e);
+            }
+        };
+
+        // First check immediately
+        await checkForNewGen();
+        // Then continue polling
+        if (!idlePollRef.current && pollCount < maxPolls) {
+            idlePollRef.current = setInterval(checkForNewGen, 3000);
         }
     }, []);
 
     const poll = useCallback(async (id) => {
         try {
-            const r = await fetch(`/api/generation/${id}`);
-            if (!r.ok) return;
-            const d = await r.json();
+            // Poll generation status, queue, AND library for cross-client sync
+            const [genResponse, queueResponse, libraryResponse] = await Promise.all([
+                fetch(`/api/generation/${id}`),
+                fetch('/api/queue'),
+                fetch('/api/generations')
+            ]);
+
+            // Update queue from server
+            if (queueResponse.ok) {
+                const queueData = await queueResponse.json();
+                setQueue(queueData);
+            }
+
+            // Update library from server (ensures all clients see completed/new generations)
+            if (libraryResponse.ok) {
+                const libraryData = await libraryResponse.json();
+                setLibrary(libraryData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+            }
+
+            if (!genResponse.ok) {
+                // 404 means generation doesn't exist - stop polling
+                if (genResponse.status === 404) {
+                    console.warn(`Generation ${id} not found (404), stopping poll`);
+                    cleanupGeneration();
+                }
+                return;
+            }
+            const d = await genResponse.json();
             setProgress(d.progress);
             setStatus(d.message);
+
+            // Use server-provided elapsed time for consistency across all clients
+            if (typeof d.elapsed_seconds === 'number') {
+                setElapsedTime(d.elapsed_seconds);
+            }
+
             if (d.status === 'completed') {
                 setAudio({ id, files: d.output_files });
-                loadLibrary();
                 cleanupGeneration();
             } else if (d.status === 'failed' || d.status === 'stopped') {
                 if (d.status === 'failed') setError(d.message);
@@ -366,6 +606,66 @@ var App = () => {
             }
         } catch (e) { console.error(e); }
     }, [cleanupGeneration]);
+
+    // Idle polling - checks for server-started generations (e.g. from queue)
+    // This runs when no generation is being tracked by this client
+    const idlePoll = useCallback(async () => {
+        try {
+            const [queueResponse, libraryResponse] = await Promise.all([
+                fetch('/api/queue'),
+                fetch('/api/generations')
+            ]);
+
+            // Update queue from server
+            if (queueResponse.ok) {
+                const queueData = await queueResponse.json();
+                setQueue(queueData);
+            }
+
+            // Check library for any active generations
+            if (libraryResponse.ok) {
+                const libraryData = await libraryResponse.json();
+                setLibrary(libraryData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+
+                // Look for any active generation we should track
+                const activeGen = libraryData.find(g => g.status === 'pending' || g.status === 'processing');
+                if (activeGen && !currentGenId) {
+                    console.log(`[IdlePoll] Found active generation: ${activeGen.id} (${activeGen.status})`);
+                    // Stop idle polling and start tracking this generation
+                    clearInterval(idlePollRef.current);
+                    idlePollRef.current = null;
+                    setCurrentGenId(activeGen.id);
+                    setCurrentGenPayload({ title: activeGen.title });
+                    setGenerating(true);
+                    setProgress(activeGen.progress || 0);
+                    setStatus(activeGen.message || 'Processing...');
+                    // Start regular polling for this generation
+                    pollRef.current = setInterval(() => poll(activeGen.id), 2000);
+                }
+            }
+        } catch (e) {
+            console.error('[IdlePoll] Error:', e);
+        }
+    }, [currentGenId, poll]);
+
+    // Start idle polling (called when generation ends or when conflict detected)
+    const startIdlePolling = useCallback(() => {
+        if (idlePollRef.current) return;  // Already polling
+        console.log('[IdlePoll] Starting idle polling');
+        // Poll immediately once
+        idlePoll();
+        // Then poll every 3 seconds
+        idlePollRef.current = setInterval(idlePoll, 3000);
+    }, [idlePoll]);
+
+    // Stop idle polling
+    const stopIdlePolling = useCallback(() => {
+        if (idlePollRef.current) {
+            console.log('[IdlePoll] Stopping idle polling');
+            clearInterval(idlePollRef.current);
+            idlePollRef.current = null;
+        }
+    }, []);
 
     const createPayload = () => ({
         title,
@@ -418,15 +718,15 @@ var App = () => {
             setGenerating(false);
             setCurrentGenId(null);
             setCurrentGenPayload(null);
-            setError(e.message);
-            setQueue(prev => {
-                if (prev.length > 0) {
-                    const [next, ...rest] = prev;
-                    setTimeout(() => startGeneration(next), 100);
-                    return rest;
-                }
-                return prev;
-            });
+            clearInterval(timerRef.current);
+            // Handle 409 conflict - another generation is already running
+            if (e.message.includes('409') || e.message.includes('already in progress')) {
+                console.log('Generation conflict - server already running a generation');
+                // Start idle polling to track the server's generation
+                startIdlePolling();
+            } else {
+                setError(e.message);
+            }
         }
     };
 
@@ -434,29 +734,37 @@ var App = () => {
         const payload = createPayload();
 
         if (generating) {
-            setQueue(prev => [...prev, payload]);  // Add to end of queue (FIFO)
+            await addToQueue(payload);  // Add to server-side queue
         } else {
             setGenerating(true);
             startGeneration(payload);
         }
     };
 
-    const stopGeneration = async () => {
-        if (!currentGenId) return;
+    const stopGeneration = async (genId = null) => {
+        const idToStop = genId || currentGenId;
+        if (!idToStop) return;
         try {
-            await fetch(`/api/stop/${currentGenId}`, { method: 'POST' });
-            setStatus('Stopping...');
+            await fetch(`/api/stop/${idToStop}`, { method: 'POST' });
+            if (idToStop === currentGenId) {
+                setStatus('Stopping...');
+            }
+            // Immediately refresh library and queue to show updated status
+            await Promise.all([loadLibrary(), loadQueue()]);
         } catch (e) {
             console.error('Failed to stop:', e);
         }
     };
 
-    const clearQueue = () => {
-        setQueue([]);
+    const clearQueueHandler = async () => {
+        try {
+            await fetch('/api/queue', { method: 'DELETE' });
+            await loadQueue();
+        } catch (e) { console.error('Error clearing queue:', e); }
     };
 
-    const removeFromQueue = (index) => {
-        setQueue(prev => prev.filter((_, i) => i !== index));
+    const removeFromQueueHandler = async (itemId) => {
+        await removeFromQueue(itemId);
     };
 
     const toggleAddMenu = (e) => {
@@ -618,20 +926,153 @@ var App = () => {
                         {/* Model */}
                         <Card>
                             <CardTitle>Model</CardTitle>
-                            <div style={{ position: 'relative' }}>
-                                <select
-                                    className="custom-select input-base"
-                                    value={selectedModel}
-                                    onChange={e => setSelectedModel(e.target.value)}
-                                    style={{ paddingRight: '40px', cursor: 'pointer' }}
-                                >
-                                    {models.map(m => <option key={m.id} value={m.id}>{m.name} - {m.description}</option>)}
-                                    {models.length === 0 && <option value="">Loading...</option>}
-                                </select>
-                                <div style={{ position: 'absolute', right: '14px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
-                                    <ChevronIcon />
+                            {/* Model selector - only ready models */}
+                            {hasReadyModel ? (
+                                <div style={{ position: 'relative', marginBottom: '12px' }}>
+                                    <select
+                                        className="custom-select input-base"
+                                        value={selectedModel}
+                                        onChange={e => setSelectedModel(e.target.value)}
+                                        style={{ paddingRight: '40px', cursor: 'pointer' }}
+                                    >
+                                        {models.map(m => (
+                                            <option key={m.id} value={m.id}>{m.name}</option>
+                                        ))}
+                                    </select>
+                                    <div style={{ position: 'absolute', right: '14px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
+                                        <ChevronIcon />
+                                    </div>
                                 </div>
-                            </div>
+                            ) : isInitializing || autoDownloadStarting ? (
+                                <div style={{
+                                    backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                                    border: '1px solid rgba(99, 102, 241, 0.3)',
+                                    borderRadius: '8px',
+                                    padding: '12px',
+                                    marginBottom: '12px',
+                                    textAlign: 'center',
+                                }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                                        <SpinnerIcon />
+                                        <span style={{ color: '#6366F1', fontSize: '13px', fontWeight: '500' }}>
+                                            {autoDownloadStarting ? 'Starting download...' : 'Loading models...'}
+                                        </span>
+                                    </div>
+                                </div>
+                            ) : allModels.some(m => m.status === 'downloading') ? (
+                                <div style={{
+                                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                                    border: '1px solid rgba(245, 158, 11, 0.3)',
+                                    borderRadius: '8px',
+                                    padding: '12px',
+                                    marginBottom: '12px',
+                                    textAlign: 'center',
+                                }}>
+                                    <div style={{ color: '#F59E0B', fontSize: '13px', fontWeight: '500' }}>
+                                        Downloading model...
+                                    </div>
+                                </div>
+                            ) : (
+                                <div style={{
+                                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                                    border: '1px solid rgba(245, 158, 11, 0.3)',
+                                    borderRadius: '8px',
+                                    padding: '12px',
+                                    marginBottom: '12px',
+                                    textAlign: 'center',
+                                }}>
+                                    <div style={{ color: '#F59E0B', fontSize: '13px', fontWeight: '500', marginBottom: '4px' }}>
+                                        No Models Downloaded
+                                    </div>
+                                    <div style={{ color: '#888', fontSize: '11px' }}>
+                                        Click "Manage Models" to download
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Download progress indicator (if any model is downloading) */}
+                            {allModels.filter(m => m.status === 'downloading').map(m => (
+                                <div key={m.id} style={{
+                                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                                    border: '1px solid rgba(245, 158, 11, 0.3)',
+                                    borderRadius: '8px',
+                                    padding: '10px 12px',
+                                    marginBottom: '12px',
+                                }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                                        <span style={{ fontSize: '12px', color: '#F59E0B', fontWeight: '500' }}>
+                                            Downloading {m.name}
+                                        </span>
+                                        <span style={{ fontSize: '11px', color: '#888' }}>{m.progress || 0}%</span>
+                                    </div>
+                                    <div style={{
+                                        height: '6px',
+                                        backgroundColor: 'rgba(245, 158, 11, 0.2)',
+                                        borderRadius: '3px',
+                                        overflow: 'hidden',
+                                    }}>
+                                        <div style={{
+                                            width: `${m.progress || 0}%`,
+                                            height: '100%',
+                                            backgroundColor: '#F59E0B',
+                                            borderRadius: '3px',
+                                            transition: 'width 0.3s ease',
+                                        }} />
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px' }}>
+                                        <span style={{ fontSize: '10px', color: '#666' }}>
+                                            {m.downloaded_gb ? `${m.downloaded_gb.toFixed(1)}GB / ${m.size_gb}GB` : `~${m.size_gb}GB`}
+                                        </span>
+                                        <button
+                                            onClick={() => cancelModelDownload(m.id)}
+                                            style={{
+                                                background: 'none',
+                                                border: 'none',
+                                                color: '#EF4444',
+                                                cursor: 'pointer',
+                                                padding: '2px 6px',
+                                                fontSize: '10px',
+                                            }}
+                                        >
+                                            Cancel
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+
+                            {/* Manage Models button */}
+                            <button
+                                onClick={() => setShowModelManager(true)}
+                                style={{
+                                    width: '100%',
+                                    padding: '10px',
+                                    backgroundColor: '#2a2a2a',
+                                    border: '1px solid #444',
+                                    borderRadius: '8px',
+                                    color: '#fff',
+                                    fontSize: '12px',
+                                    cursor: 'pointer',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    gap: '8px',
+                                    transition: 'all 0.2s ease',
+                                }}
+                                onMouseEnter={e => {
+                                    e.target.style.backgroundColor = '#333';
+                                    e.target.style.borderColor = '#555';
+                                }}
+                                onMouseLeave={e => {
+                                    e.target.style.backgroundColor = '#2a2a2a';
+                                    e.target.style.borderColor = '#444';
+                                }}
+                            >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="3"/>
+                                    <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+                                </svg>
+                                Manage Models
+                            </button>
                         </Card>
 
                         {/* Memory Mode */}
@@ -886,16 +1327,19 @@ var App = () => {
                         {/* Generate Button */}
                         <button
                             onClick={generate}
+                            disabled={!hasReadyModel}
+                            title={!hasReadyModel ? 'Download a model first' : ''}
                             style={{
                                 width: '100%',
-                                backgroundColor: generating ? '#6366F1' : '#10B981',
+                                backgroundColor: !hasReadyModel ? '#444' : generating ? '#6366F1' : '#10B981',
                                 color: '#fff',
                                 border: 'none',
                                 borderRadius: '12px',
                                 padding: '16px 24px',
                                 fontSize: '15px',
                                 fontWeight: '600',
-                                cursor: 'pointer',
+                                cursor: !hasReadyModel ? 'not-allowed' : 'pointer',
+                                opacity: !hasReadyModel ? 0.6 : 1,
                                 display: 'flex',
                                 alignItems: 'center',
                                 justifyContent: 'center',
@@ -903,7 +1347,9 @@ var App = () => {
                                 transition: 'all 0.15s',
                             }}
                         >
-                            {generating ? (
+                            {!hasReadyModel ? (
+                                'Download Model to Generate'
+                            ) : generating ? (
                                 <><PlusIcon /> Add to Queue {queue.length > 0 && `(${queue.length})`}</>
                             ) : (
                                 <><PlayIcon size={16} /> Generate</>
@@ -1132,7 +1578,29 @@ var App = () => {
                                                 display: 'flex',
                                                 gap: '10px',
                                                 alignItems: 'center',
+                                                position: 'relative',
                                             }}>
+                                                {/* X button top right to remove from queue */}
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); removeFromQueue(item.id); }}
+                                                    style={{
+                                                        position: 'absolute',
+                                                        top: '4px',
+                                                        right: '4px',
+                                                        background: 'none',
+                                                        border: 'none',
+                                                        color: '#666',
+                                                        cursor: 'pointer',
+                                                        padding: '2px',
+                                                        zIndex: 2,
+                                                        display: 'flex',
+                                                    }}
+                                                    onMouseEnter={(e) => e.currentTarget.style.color = '#EF4444'}
+                                                    onMouseLeave={(e) => e.currentTarget.style.color = '#666'}
+                                                    title="Remove from queue"
+                                                >
+                                                    <CloseIcon size={10} />
+                                                </button>
                                                 {/* Album Cover with Queue Number */}
                                                 <div style={{
                                                     width: '44px',
@@ -1154,9 +1622,6 @@ var App = () => {
                                                     </div>
                                                     <div className="text-xs text-muted">In queue</div>
                                                 </div>
-                                                <button onClick={(e) => { e.stopPropagation(); removeFromQueue(index); }} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: '4px', display: 'flex', flexShrink: 0 }}>
-                                                    <CloseIcon />
-                                                </button>
                                             </div>
                                         ))}
 
@@ -1184,6 +1649,27 @@ var App = () => {
                                                     transition: 'width 0.5s ease',
                                                     zIndex: 0,
                                                 }} />
+                                                {/* X button top right to stop */}
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); stopGeneration(); }}
+                                                    style={{
+                                                        position: 'absolute',
+                                                        top: '4px',
+                                                        right: '4px',
+                                                        background: 'none',
+                                                        border: 'none',
+                                                        color: '#666',
+                                                        cursor: 'pointer',
+                                                        padding: '2px',
+                                                        zIndex: 2,
+                                                        display: 'flex',
+                                                    }}
+                                                    onMouseEnter={(e) => e.currentTarget.style.color = '#EF4444'}
+                                                    onMouseLeave={(e) => e.currentTarget.style.color = '#666'}
+                                                    title="Stop generation"
+                                                >
+                                                    <CloseIcon size={10} />
+                                                </button>
                                                 {/* Album Cover with Spinner */}
                                                 <div style={{
                                                     width: '44px',
@@ -1217,21 +1703,69 @@ var App = () => {
                                             const isPlaying = activityPlayingId === item.id;
                                             const canPlay = item.status === 'completed' && (item.output_file || (item.output_files && item.output_files.length > 0));
                                             const isFailed = item.status === 'failed' || item.status === 'stopped';
+                                            const isProcessing = item.status === 'processing' || item.status === 'generating' || item.status === 'pending';
+                                            const canDelete = item.status === 'completed' || item.status === 'failed' || item.status === 'stopped';
                                             const hasCover = meta.cover;
                                             // Add timestamp for cache busting when library is refreshed
                                             const coverUrl = hasCover ? `/api/generation/${item.id}/cover?v=${meta.cover}` : null;
                                             return (
                                                 <div key={item.id}
-                                                    className={`activity-item ${isPlaying ? 'active' : ''} ${isFailed ? 'error' : ''}`}
-                                                    style={{ cursor: canPlay ? 'pointer' : 'default', display: 'flex', gap: '10px', alignItems: 'center' }}
+                                                    className={`activity-item ${isPlaying ? 'active' : ''} ${isFailed ? 'error' : ''} ${isProcessing ? 'processing' : ''}`}
+                                                    style={{ cursor: canPlay ? 'pointer' : 'default', display: 'flex', gap: '10px', alignItems: 'center', position: 'relative' }}
                                                     onClick={() => canPlay && playActivityAudio(item)}
                                                 >
+                                                    {/* X button top right to stop (for processing) */}
+                                                    {isProcessing && (
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); stopGeneration(item.id); }}
+                                                            style={{
+                                                                position: 'absolute',
+                                                                top: '4px',
+                                                                right: '4px',
+                                                                background: 'none',
+                                                                border: 'none',
+                                                                color: '#666',
+                                                                cursor: 'pointer',
+                                                                padding: '2px',
+                                                                zIndex: 2,
+                                                                display: 'flex',
+                                                            }}
+                                                            onMouseEnter={(e) => e.currentTarget.style.color = '#EF4444'}
+                                                            onMouseLeave={(e) => e.currentTarget.style.color = '#666'}
+                                                            title="Stop generation"
+                                                        >
+                                                            <CloseIcon size={10} />
+                                                        </button>
+                                                    )}
+                                                    {/* Trash button top right (for completed/failed/stopped) */}
+                                                    {canDelete && (
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); deleteGeneration(item.id); }}
+                                                            style={{
+                                                                position: 'absolute',
+                                                                top: '4px',
+                                                                right: '4px',
+                                                                background: 'none',
+                                                                border: 'none',
+                                                                color: '#555',
+                                                                cursor: 'pointer',
+                                                                padding: '2px',
+                                                                zIndex: 2,
+                                                                display: 'flex',
+                                                            }}
+                                                            onMouseEnter={(e) => e.currentTarget.style.color = '#EF4444'}
+                                                            onMouseLeave={(e) => e.currentTarget.style.color = '#555'}
+                                                            title="Delete"
+                                                        >
+                                                            <TrashIcon size={10} />
+                                                        </button>
+                                                    )}
                                                     {/* Album Cover */}
                                                     <div style={{
                                                         width: '44px',
                                                         height: '44px',
                                                         borderRadius: '6px',
-                                                        backgroundColor: isPlaying ? '#10B981' : isFailed ? '#EF4444' : '#2a2a2a',
+                                                        backgroundColor: isProcessing ? '#F59E0B' : isPlaying ? '#10B981' : isFailed ? '#EF4444' : '#2a2a2a',
                                                         display: 'flex',
                                                         alignItems: 'center',
                                                         justifyContent: 'center',
@@ -1242,7 +1776,9 @@ var App = () => {
                                                         backgroundPosition: 'center',
                                                         position: 'relative',
                                                     }}>
-                                                        {canPlay ? (
+                                                        {isProcessing ? (
+                                                            <SpinnerIcon />
+                                                        ) : canPlay ? (
                                                             <div style={{
                                                                 width: '100%',
                                                                 height: '100%',
@@ -1270,7 +1806,7 @@ var App = () => {
                                                             {meta.title || 'Untitled'}
                                                         </div>
                                                         <div className="text-xs text-secondary truncate" style={{ marginBottom: '2px' }}>
-                                                            {[meta.genre, meta.emotion].filter(Boolean).join(' • ') || 'No tags'}
+                                                            {isProcessing ? 'Generating...' : ([meta.genre, meta.emotion].filter(Boolean).join(' • ') || 'No tags')}
                                                         </div>
                                                         <div className="text-xs text-muted">
                                                             {new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -1308,11 +1844,11 @@ var App = () => {
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                             {queue.map((item, index) => (
                                 <LibraryItem
-                                    key={`queue-${index}`}
+                                    key={`queue-${item.id}`}
                                     item={item}
                                     isQueued={true}
                                     queuePosition={index + 1}
-                                    onRemoveFromQueue={() => removeFromQueue(index)}
+                                    onRemoveFromQueue={() => removeFromQueue(item.id)}
                                 />
                             ))}
                             {currentGenPayload && (
@@ -1320,13 +1856,13 @@ var App = () => {
                                     key="generating"
                                     item={currentGenPayload}
                                     isGenerating={true}
-                                    onStop={stopGeneration}
+                                    onStop={() => stopGeneration()}
                                     status={status}
                                     elapsedTime={elapsedTime}
                                     estimatedTime={estimatedTime}
                                 />
                             )}
-                            {library.filter(item => !currentGenId || item.id !== currentGenId).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id)} onPlay={playActivityAudio} onUpdate={loadLibrary} isCurrentlyPlaying={activityPlayingId === item.id} isAudioPlaying={isAudioPlaying} />)}
+                            {library.filter(item => !currentGenId || item.id !== currentGenId).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id)} onPlay={playActivityAudio} onUpdate={loadLibrary} onStop={() => stopGeneration(item.id)} isCurrentlyPlaying={activityPlayingId === item.id} isAudioPlaying={isAudioPlaying} />)}
                         </div>
                     )}
                 </div>
@@ -1497,6 +2033,207 @@ var App = () => {
                     />
                 </div>
             </footer>
+
+            {/* Model Manager Modal */}
+            {showModelManager && (
+                <div style={{
+                    position: 'fixed',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    zIndex: 1000,
+                }} onClick={() => setShowModelManager(false)}>
+                    <div
+                        style={{
+                            backgroundColor: '#1a1a1a',
+                            borderRadius: '16px',
+                            padding: '24px',
+                            width: '500px',
+                            maxWidth: '90vw',
+                            maxHeight: '80vh',
+                            overflow: 'auto',
+                            border: '1px solid #333',
+                            boxShadow: '0 20px 60px rgba(0, 0, 0, 0.5)',
+                        }}
+                        onClick={e => e.stopPropagation()}
+                    >
+                        {/* Header */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                            <h2 style={{ margin: 0, fontSize: '18px', fontWeight: '600', color: '#fff' }}>
+                                Model Manager
+                            </h2>
+                            <button
+                                onClick={() => setShowModelManager(false)}
+                                style={{
+                                    background: 'none',
+                                    border: 'none',
+                                    color: '#888',
+                                    cursor: 'pointer',
+                                    fontSize: '20px',
+                                    padding: '4px 8px',
+                                    lineHeight: 1,
+                                }}
+                            >
+                                x
+                            </button>
+                        </div>
+
+                        {/* GPU Info */}
+                        {gpuInfo && gpuInfo.gpu && (
+                            <div style={{
+                                backgroundColor: '#252525',
+                                borderRadius: '8px',
+                                padding: '12px',
+                                marginBottom: '16px',
+                                fontSize: '12px',
+                            }}>
+                                <div style={{ color: '#fff', fontWeight: '500', marginBottom: '4px' }}>
+                                    {gpuInfo.gpu.name}
+                                </div>
+                                <div style={{ color: '#888' }}>
+                                    {gpuInfo.gpu.free_gb}GB available / {gpuInfo.gpu.total_gb}GB total
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Model List */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                            {allModels.map(m => (
+                                <div key={m.id} style={{
+                                    backgroundColor: '#252525',
+                                    borderRadius: '12px',
+                                    padding: '16px',
+                                    border: m.status === 'ready' ? '1px solid rgba(16, 185, 129, 0.3)' : '1px solid #333',
+                                }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '8px' }}>
+                                        <div>
+                                            <div style={{ fontSize: '14px', fontWeight: '500', color: '#fff', marginBottom: '4px' }}>
+                                                {m.name}
+                                                {m.id === recommendedModel && (
+                                                    <span style={{
+                                                        marginLeft: '8px',
+                                                        fontSize: '10px',
+                                                        backgroundColor: 'rgba(16, 185, 129, 0.2)',
+                                                        color: '#10B981',
+                                                        padding: '2px 6px',
+                                                        borderRadius: '4px',
+                                                    }}>
+                                                        Recommended
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <div style={{ fontSize: '12px', color: '#888' }}>{m.description}</div>
+                                        </div>
+                                        <div style={{ textAlign: 'right', fontSize: '11px', color: '#666' }}>
+                                            <div>{m.size_gb}GB</div>
+                                            <div>{m.vram_required}GB VRAM</div>
+                                        </div>
+                                    </div>
+
+                                    {/* Status & Actions */}
+                                    {m.status === 'ready' && (
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                            <span style={{ fontSize: '12px', color: '#10B981', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                                                    <polyline points="20 6 9 17 4 12"/>
+                                                </svg>
+                                                Ready to use
+                                            </span>
+                                            <button
+                                                onClick={() => deleteModel(m.id)}
+                                                style={{
+                                                    padding: '6px 12px',
+                                                    fontSize: '11px',
+                                                    backgroundColor: 'transparent',
+                                                    color: '#EF4444',
+                                                    border: '1px solid rgba(239, 68, 68, 0.3)',
+                                                    borderRadius: '6px',
+                                                    cursor: 'pointer',
+                                                }}
+                                            >
+                                                Delete
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {m.status === 'downloading' && (
+                                        <div>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                                                <span style={{ fontSize: '12px', color: '#F59E0B' }}>
+                                                    Downloading... {m.progress || 0}%
+                                                </span>
+                                                <button
+                                                    onClick={() => cancelModelDownload(m.id)}
+                                                    style={{
+                                                        padding: '4px 10px',
+                                                        fontSize: '11px',
+                                                        backgroundColor: 'transparent',
+                                                        color: '#EF4444',
+                                                        border: '1px solid rgba(239, 68, 68, 0.3)',
+                                                        borderRadius: '6px',
+                                                        cursor: 'pointer',
+                                                    }}
+                                                >
+                                                    Cancel
+                                                </button>
+                                            </div>
+                                            <div style={{
+                                                height: '6px',
+                                                backgroundColor: '#333',
+                                                borderRadius: '3px',
+                                                overflow: 'hidden',
+                                            }}>
+                                                <div style={{
+                                                    width: `${m.progress || 0}%`,
+                                                    height: '100%',
+                                                    backgroundColor: '#F59E0B',
+                                                    borderRadius: '3px',
+                                                    transition: 'width 0.3s ease',
+                                                }} />
+                                            </div>
+                                            {m.speed_mbps > 0 && (
+                                                <div style={{ fontSize: '10px', color: '#666', marginTop: '6px' }}>
+                                                    {m.speed_mbps.toFixed(1)} MB/s
+                                                    {m.eta_seconds > 0 && ` - ~${Math.ceil(m.eta_seconds / 60)} min remaining`}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {m.status === 'not_downloaded' && (
+                                        <button
+                                            onClick={() => startModelDownload(m.id)}
+                                            style={{
+                                                width: '100%',
+                                                padding: '10px',
+                                                fontSize: '12px',
+                                                backgroundColor: '#10B981',
+                                                color: '#fff',
+                                                border: 'none',
+                                                borderRadius: '8px',
+                                                cursor: 'pointer',
+                                                fontWeight: '500',
+                                            }}
+                                        >
+                                            Download ({m.size_gb}GB)
+                                        </button>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+
+                        {/* Footer note */}
+                        <div style={{ marginTop: '16px', fontSize: '11px', color: '#666', textAlign: 'center' }}>
+                            Models are stored locally. Delete unused models to free disk space.
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };

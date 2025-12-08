@@ -1659,7 +1659,10 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                         </button>
                     </>
                 )}
-                {isGenerating && <button className="btn-icon btn-danger" onClick={onStop}>Stop</button>}
+                {/* Stop button - show for currently generating OR library items with processing status */}
+                {(isGenerating || (!isQueued && (item.status === 'processing' || item.status === 'generating' || item.status === 'pending'))) && (
+                    <button className="btn-icon btn-danger" onClick={onStop}>Stop</button>
+                )}
                 {isQueued && <button className="btn-icon btn-danger" onClick={onRemoveFromQueue}>Remove</button>}
                 {!isQueued && !isGenerating && item.status === 'completed' && (
                     <button className="btn-icon" onClick={() => setEditing(true)} title="Edit"><EditIcon /></button>

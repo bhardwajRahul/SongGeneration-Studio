@@ -43,34 +43,8 @@ module.exports = {
         "local-dir": "."
       }
     },
-    // 5. Download base model (~24GB)
-    {
-      method: "hf.download",
-      params: {
-        path: "app",
-        _: ["lglg666/SongGeneration-base"],
-        "local-dir": "songgeneration_base"
-      }
-    },
-    // 6. Download base-new model
-    {
-      method: "hf.download",
-      params: {
-        path: "app",
-        _: ["lglg666/SongGeneration-base-new"],
-        "local-dir": "songgeneration_base_new"
-      }
-    },
-    // 7. Download base-full model
-    {
-      method: "hf.download",
-      params: {
-        path: "app",
-        _: ["lglg666/SongGeneration-base-full"],
-        "local-dir": "songgeneration_base_full"
-      }
-    },
-    // 8. Copy API file
+    // Note: Models are now downloaded on-demand through the web UI
+    // 5. Copy API file
     {
       method: "fs.copy",
       params: {
@@ -78,7 +52,7 @@ module.exports = {
         dest: "app/api.py"
       }
     },
-    // 9. Copy web files (all static files)
+    // 6. Copy web files (all static files)
     {
       method: "fs.copy",
       params: {
