@@ -2403,9 +2403,9 @@ async def add_to_queue(payload: dict):
         "added_at": datetime.now().isoformat(),
         **payload
     }
-    queue.append(item)
+    queue.insert(0, item)  # Add at top of queue
     save_queue(queue)
-    print(f"[QUEUE] Added item: {item.get('title', 'Untitled')}")
+    print(f"[QUEUE] Added item at top: {item.get('title', 'Untitled')}")
 
     # Notify all clients
     notify_queue_update()
