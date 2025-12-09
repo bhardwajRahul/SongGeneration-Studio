@@ -677,7 +677,8 @@ var App = () => {
         setActivityPlayingId(item.id);
         setActivityPlayingItem(item);
         setAudioProgress(0);
-        setAudioDuration(0);
+        // Use item duration if available, otherwise 0
+        setAudioDuration(item.duration || 0);
         setIsAudioPlaying(true);
 
         const audio = new Audio();
@@ -693,7 +694,13 @@ var App = () => {
             setIsAudioPlaying(false);
         };
         audio.ontimeupdate = () => setAudioProgress(audio.currentTime);
-        audio.onloadedmetadata = () => setAudioDuration(audio.duration);
+        audio.onloadedmetadata = () => {
+            // Only use browser duration if valid, otherwise keep item.duration
+            const dur = audio.duration;
+            if (dur && !isNaN(dur) && isFinite(dur)) {
+                setAudioDuration(dur);
+            }
+        };
         audio.src = `/api/audio/${item.id}/0`;
         activityAudioRef.current = audio;
         audio.play().then(() => {

@@ -28,6 +28,7 @@ app/output/
 app/uploads/
 app/timing_history.json
 app/queue.json
+app/verified_models.json
 
 # Model files (downloaded during install)
 app/songgeneration_*/

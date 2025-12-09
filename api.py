@@ -115,11 +115,57 @@ OUTPUT_DIR = BASE_DIR / "output"
 UPLOADS_DIR = BASE_DIR / "uploads"
 STATIC_DIR = BASE_DIR / "web" / "static"
 QUEUE_FILE = BASE_DIR / "queue.json"
+VERIFIED_MODELS_FILE = BASE_DIR / "verified_models.json"
 
 # Create directories
 OUTPUT_DIR.mkdir(exist_ok=True)
 UPLOADS_DIR.mkdir(exist_ok=True)
 (BASE_DIR / "web" / "static").mkdir(parents=True, exist_ok=True)
+
+# Cache for verified model sizes (persisted to disk)
+# Format: {model_id: {"verified": True, "model_pt_size": bytes, "verified_at": timestamp}}
+verified_models_cache: Dict[str, dict] = {}
+
+def load_verified_models() -> dict:
+    """Load verified models cache from disk"""
+    try:
+        if VERIFIED_MODELS_FILE.exists():
+            with open(VERIFIED_MODELS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_verified_models(cache: dict):
+    """Save verified models cache to disk"""
+    try:
+        with open(VERIFIED_MODELS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
+def mark_model_verified(model_id: str, model_pt_size: int):
+    """Mark a model as verified (size checked against HuggingFace)"""
+    global verified_models_cache
+    verified_models_cache[model_id] = {
+        "verified": True,
+        "model_pt_size": model_pt_size,
+        "verified_at": datetime.now().isoformat()
+    }
+    save_verified_models(verified_models_cache)
+
+def is_model_verified(model_id: str) -> bool:
+    """Check if model has been verified (no need to call HuggingFace again)"""
+    return model_id in verified_models_cache and verified_models_cache[model_id].get("verified")
+
+def get_verified_model_size(model_id: str) -> int:
+    """Get verified model.pt size if available"""
+    if model_id in verified_models_cache:
+        return verified_models_cache[model_id].get("model_pt_size", 0)
+    return 0
+
+# Load verified models cache on startup
+verified_models_cache = load_verified_models()
 
 # ============================================================================
 # Server-side Queue Storage
@@ -339,7 +385,7 @@ def get_model_status(model_id: str) -> str:
     A model is only 'ready' if:
     1. The folder exists
     2. The model file (model.pt) exists
-    3. The model file size EXACTLY matches the expected size from HuggingFace
+    3. The model file size matches expected (verified cache or HuggingFace)
     """
     # Check if currently downloading
     if model_id in download_states and download_states[model_id].get("status") == "downloading":
@@ -352,20 +398,29 @@ def get_model_status(model_id: str) -> str:
     if model_id not in MODEL_REGISTRY:
         return "not_downloaded"
 
-    # Get expected file sizes from HuggingFace (cached)
-    expected_sizes = get_expected_file_sizes(model_id)
-
     # Check model.pt specifically (the main model file)
     model_file = folder_path / "model.pt"
     if model_file.exists():
         try:
             actual_size = model_file.stat().st_size
+
+            # FAST PATH: If model was previously verified, just check size matches
+            if is_model_verified(model_id):
+                verified_size = get_verified_model_size(model_id)
+                if verified_size > 0 and actual_size == verified_size:
+                    return "ready"
+                # Size changed - need to re-verify
+
+            # SLOW PATH: Check against HuggingFace API (only on first check or size change)
+            expected_sizes = get_expected_file_sizes(model_id)
             expected_size = expected_sizes.get('model.pt', 0)
 
             if expected_size > 0:
-                # We have expected size from HuggingFace - allow 0.1% tolerance for minor variations
+                # We have expected size from HuggingFace - allow 0.1% tolerance
                 size_diff_pct = abs(actual_size - expected_size) / expected_size * 100
-                if size_diff_pct < 0.1:  # Within 0.1% is considered ready
+                if size_diff_pct < 0.1:
+                    # Mark as verified so future checks are instant
+                    mark_model_verified(model_id, actual_size)
                     return "ready"
                 else:
                     actual_gb = actual_size / (1024 * 1024 * 1024)
@@ -374,11 +429,10 @@ def get_model_status(model_id: str) -> str:
                     print(f"[MODEL] {model_id}/model.pt incomplete: {actual_size:,} / {expected_size:,} bytes ({pct:.1f}%) - {actual_gb:.2f}GB / {expected_gb:.2f}GB")
             else:
                 # No expected size from HuggingFace - fallback to registry size
-                # Note: registry size_gb is in decimal GB (1000^3), not binary GiB (1024^3)
                 expected_size_gb = MODEL_REGISTRY[model_id]["size_gb"]
-                # Allow 5% tolerance for fallback (might have slight differences)
                 min_required_bytes = int(expected_size_gb * 0.95 * 1000 * 1000 * 1000)
                 if actual_size >= min_required_bytes:
+                    mark_model_verified(model_id, actual_size)
                     return "ready"
                 else:
                     actual_gb = actual_size / (1000 * 1000 * 1000)
@@ -392,18 +446,26 @@ def get_model_status(model_id: str) -> str:
     if model_file_st.exists():
         try:
             actual_size = model_file_st.stat().st_size
+
+            # Fast path for verified models
+            if is_model_verified(model_id):
+                verified_size = get_verified_model_size(model_id)
+                if verified_size > 0 and actual_size == verified_size:
+                    return "ready"
+
+            expected_sizes = get_expected_file_sizes(model_id)
             expected_size = expected_sizes.get('model.safetensors', 0)
 
             if expected_size > 0:
-                # Allow 0.1% tolerance
                 size_diff_pct = abs(actual_size - expected_size) / expected_size * 100
                 if size_diff_pct < 0.1:
+                    mark_model_verified(model_id, actual_size)
                     return "ready"
             else:
-                # Fallback - use decimal GB
                 expected_size_gb = MODEL_REGISTRY[model_id]["size_gb"]
                 min_required_bytes = int(expected_size_gb * 0.95 * 1000 * 1000 * 1000)
                 if actual_size >= min_required_bytes:
+                    mark_model_verified(model_id, actual_size)
                     return "ready"
         except (OSError, IOError):
             pass
@@ -923,9 +985,14 @@ def get_model_server_status() -> dict:
     try:
         resp = requests.get(f"{MODEL_SERVER_URL}/status", timeout=2)
         if resp.status_code == 200:
-            return resp.json()
-    except:
-        pass
+            data = resp.json()
+            return data
+    except requests.exceptions.Timeout:
+        pass  # Server not responding quickly
+    except requests.exceptions.ConnectionError:
+        pass  # Server not running
+    except Exception as e:
+        print(f"[MODEL_SERVER] Status check error: {e}")
     return {"loaded": False, "running": False}
 
 # Model status tracking - check actual model server status

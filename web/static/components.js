@@ -193,7 +193,11 @@ var DarkAudioPlayer = ({ src }) => {
 
     const handleLoadedMetadata = () => {
         if (audioRef.current) {
-            setDuration(audioRef.current.duration);
+            const dur = audioRef.current.duration;
+            // Only set if valid (not NaN or Infinity)
+            if (dur && !isNaN(dur) && isFinite(dur)) {
+                setDuration(dur);
+            }
         }
     };
 
@@ -210,7 +214,7 @@ var DarkAudioPlayer = ({ src }) => {
         setCurrentTime(0);
     };
 
-    const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+    const progress = (duration > 0 && !isNaN(duration)) ? (currentTime / duration) * 100 : 0;
 
     return (
         <div style={{
