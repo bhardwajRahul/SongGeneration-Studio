@@ -1613,7 +1613,7 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                     </span>
                 </div>
                 <div className="text-sm text-secondary" style={{ marginBottom: '6px' }}>
-                    {isGenerating ? (status || 'Generating...') : (isQueued ? `Queued` : formatDate(item.created_at))}
+                    {isGenerating ? (status || 'Generating...') : (isQueued ? `Queued` : ((item.duration || meta.duration) ? formatTime(item.duration || meta.duration) : '--:--'))}
                 </div>
                 {/* Style tags */}
                 <div className="flex gap-1" style={{ flexWrap: 'wrap' }}>

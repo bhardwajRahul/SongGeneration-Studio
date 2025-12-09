@@ -17,6 +17,7 @@ import shutil
 import threading
 import time
 import queue as queue_module
+import requests
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -87,6 +88,22 @@ if gpu_info['available']:
     print(f"[GPU] Recommended mode: {gpu_info['recommended_mode']}")
 else:
     print("[GPU] No NVIDIA GPU detected or nvidia-smi not available")
+
+# ============================================================================
+# Audio Duration Helper
+# ============================================================================
+
+def get_audio_duration(audio_path: Path) -> Optional[float]:
+    """Get audio duration in seconds using ffprobe."""
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+               '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception as e:
+        print(f"[AUDIO] Failed to get duration for {audio_path}: {e}")
+    return None
 
 # ============================================================================
 # Configuration
@@ -251,7 +268,7 @@ def get_timing_stats() -> dict:
 
 MODEL_REGISTRY: Dict[str, dict] = {
     "songgeneration_base": {
-        "name": "Base (2m30s)",
+        "name": "SongGeneration - Base (2m30s)",
         "description": "Chinese + English, 10GB VRAM, max 2m30s",
         "vram_required": 10,
         "hf_repo": "lglg666/SongGeneration-base",
@@ -259,7 +276,7 @@ MODEL_REGISTRY: Dict[str, dict] = {
         "priority": 1,  # Lower = recommended first for lower VRAM
     },
     "songgeneration_base_new": {
-        "name": "Base New (2m30s)",
+        "name": "SongGeneration - Base New (2m30s)",
         "description": "Updated base model, 10GB VRAM, max 2m30s",
         "vram_required": 10,
         "hf_repo": "lglg666/SongGeneration-base-new",
@@ -267,7 +284,7 @@ MODEL_REGISTRY: Dict[str, dict] = {
         "priority": 2,
     },
     "songgeneration_base_full": {
-        "name": "Base Full (4m30s)",
+        "name": "SongGeneration - Base Full (4m30s)",
         "description": "Full duration up to 4m30s, 12GB VRAM",
         "vram_required": 12,
         "hf_repo": "lglg666/SongGeneration-base-full",
@@ -275,7 +292,7 @@ MODEL_REGISTRY: Dict[str, dict] = {
         "priority": 3,
     },
     "songgeneration_large": {
-        "name": "Large (4m30s)",
+        "name": "SongGeneration - Large (4m30s)",
         "description": "Best quality, 22GB VRAM, max 4m30s",
         "vram_required": 22,
         "hf_repo": "lglg666/SongGeneration-large",
@@ -843,11 +860,76 @@ def get_recommended_model() -> Optional[str]:
     suitable_models.sort(key=lambda x: x[1], reverse=True)
     return suitable_models[0][0]
 
+# ============================================================================
+# Model Server (Persistent Model in VRAM) - Helper functions
+# ============================================================================
+
+MODEL_SERVER_PORT = 42100
+MODEL_SERVER_URL = f"http://127.0.0.1:{MODEL_SERVER_PORT}"
+model_server_process: Optional[subprocess.Popen] = None
+
+def is_model_server_running() -> bool:
+    """Check if model server is running and responsive."""
+    try:
+        resp = requests.get(f"{MODEL_SERVER_URL}/health", timeout=2)
+        return resp.status_code == 200
+    except:
+        return False
+
+def get_model_server_status() -> dict:
+    """Get model server status including loaded model info."""
+    try:
+        resp = requests.get(f"{MODEL_SERVER_URL}/status", timeout=0.5)
+        if resp.status_code == 200:
+            return resp.json()
+    except:
+        pass
+    return {"loaded": False, "running": False}
+
+# Model status tracking - check actual model server status
+def get_model_warmth(model_id: str) -> str:
+    """Get model status: 'loaded' (in VRAM), 'loading', 'not_loaded'"""
+    # Check model server status
+    server_status = get_model_server_status()
+
+    if server_status.get("loading"):
+        return "loading"
+
+    if server_status.get("loaded") and server_status.get("model_id") == model_id:
+        # Check if currently generating
+        if 'generations' in globals():
+            for gen in generations.values():
+                if gen.get("status") in ("processing", "pending") and gen.get("model") == model_id:
+                    return "generating"
+        return "loaded"
+
+    return "not_loaded"
+
 def get_all_models() -> List[dict]:
-    """Get all models with their current status"""
+    """Get all models with their current status and warmth"""
+    # Get model server status ONCE (avoid multiple slow HTTP calls)
+    server_status = get_model_server_status()
+
     models = []
     for model_id, info in MODEL_REGISTRY.items():
         status = get_model_status(model_id)
+        # Inline warmth check using cached server_status
+        if status == "ready":
+            if server_status.get("loading"):
+                warmth = "loading"
+            elif server_status.get("loaded") and server_status.get("model_id") == model_id:
+                # Check if currently generating
+                is_generating = False
+                if 'generations' in globals():
+                    for gen in generations.values():
+                        if gen.get("status") in ("processing", "pending") and gen.get("model") == model_id:
+                            is_generating = True
+                            break
+                warmth = "generating" if is_generating else "loaded"
+            else:
+                warmth = "not_loaded"
+        else:
+            warmth = "cold"
         model_data = {
             "id": model_id,
             "name": info["name"],
@@ -855,6 +937,7 @@ def get_all_models() -> List[dict]:
             "vram_required": info["vram_required"],
             "size_gb": info["size_gb"],
             "status": status,
+            "warmth": warmth,  # 'hot', 'warm', or 'cold'
         }
 
         # Add download progress if downloading
@@ -931,6 +1014,121 @@ class SongRequest(BaseModel):
     top_k: int = 50                # Top-K sampling (1-250)
     top_p: float = 0.0             # Nucleus sampling, 0 = disabled (0.0-1.0)
     extend_stride: int = 5         # Extension stride for longer songs
+
+# ============================================================================
+# Model Server (Persistent Model in VRAM) - Remaining functions
+# ============================================================================
+
+def start_model_server(preload_model: str = None) -> bool:
+    """Start the model server process."""
+    global model_server_process
+
+    if is_model_server_running():
+        print("[MODEL_SERVER] Already running", flush=True)
+        return True
+
+    print("[MODEL_SERVER] Starting model server...", flush=True)
+
+    # Find Python executable in virtual environment
+    if sys.platform == "win32":
+        python_exe = BASE_DIR / "env" / "Scripts" / "python.exe"
+    else:
+        python_exe = BASE_DIR / "env" / "bin" / "python"
+
+    if not python_exe.exists():
+        python_exe = sys.executable
+
+    print(f"[MODEL_SERVER] Using Python: {python_exe}", flush=True)
+
+    cmd = [str(python_exe), str(BASE_DIR / "model_server.py"),
+           "--port", str(MODEL_SERVER_PORT), "--host", "127.0.0.1"]
+
+    if preload_model:
+        cmd.extend(["--preload", preload_model])
+
+    # Set up environment
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    flow_vae_dir = BASE_DIR / "codeclm" / "tokenizer" / "Flow1dVAE"
+    pathsep = os.pathsep
+    env["PYTHONPATH"] = f"{BASE_DIR}{pathsep}{flow_vae_dir}{pathsep}{env.get('PYTHONPATH', '')}"
+
+    print(f"[MODEL_SERVER] Command: {' '.join(cmd)}", flush=True)
+    print(f"[MODEL_SERVER] PYTHONPATH: {env['PYTHONPATH']}", flush=True)
+
+    try:
+        # Don't capture stdout - let output print directly to console for debugging
+        # This prevents pipe buffer from filling up and blocking the subprocess
+        model_server_process = subprocess.Popen(
+            cmd,
+            cwd=str(BASE_DIR),
+            env=env,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+
+        # Wait for server to be ready
+        for i in range(60):  # Wait up to 60 seconds (model loading takes time)
+            time.sleep(1)
+
+            # Check if process died
+            if model_server_process.poll() is not None:
+                print(f"[MODEL_SERVER] Process exited with code {model_server_process.returncode}", flush=True)
+                return False
+
+            if is_model_server_running():
+                print(f"[MODEL_SERVER] Server started successfully after {i+1}s", flush=True)
+                return True
+
+            if i % 10 == 9:
+                print(f"[MODEL_SERVER] Still waiting... ({i+1}s)", flush=True)
+
+        print("[MODEL_SERVER] Server failed to start in time (60s timeout)", flush=True)
+        try:
+            model_server_process.terminate()
+        except:
+            pass
+        return False
+
+    except Exception as e:
+        print(f"[MODEL_SERVER] Failed to start: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def stop_model_server():
+    """Stop the model server process."""
+    global model_server_process
+
+    if model_server_process:
+        model_server_process.terminate()
+        try:
+            model_server_process.wait(timeout=5)
+        except:
+            model_server_process.kill()
+        model_server_process = None
+        print("[MODEL_SERVER] Server stopped")
+
+def load_model_on_server(model_id: str) -> dict:
+    """Request model server to load a model."""
+    try:
+        resp = requests.post(f"{MODEL_SERVER_URL}/load",
+                           json={"model_id": model_id}, timeout=5)
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+def generate_via_server(input_jsonl: str, save_dir: str, gen_type: str = "mixed") -> dict:
+    """Send generation request to model server."""
+    try:
+        resp = requests.post(f"{MODEL_SERVER_URL}/generate",
+                           json={
+                               "input_jsonl": input_jsonl,
+                               "save_dir": save_dir,
+                               "gen_type": gen_type
+                           }, timeout=600)  # 10 min timeout for generation
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 # ============================================================================
 # State
@@ -1126,6 +1324,19 @@ def restore_library():
                         print(f"[LIBRARY] Warning: Could not update metadata for {gen_id}: {e}")
                     break
 
+        # Get audio duration if not in metadata
+        duration = metadata.get("duration")
+        if duration is None and audio_files:
+            duration = get_audio_duration(audio_files[0])
+            if duration is not None:
+                metadata["duration"] = duration
+                # Update metadata file on disk
+                try:
+                    with open(metadata_path, 'w', encoding='utf-8') as f:
+                        json.dump(metadata, f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    print(f"[LIBRARY] Warning: Could not save duration for {gen_id}: {e}")
+
         generations[gen_id] = {
             "id": gen_id,
             "status": "completed",
@@ -1135,6 +1346,7 @@ def restore_library():
             "model": metadata.get("model", "unknown"),
             "created_at": metadata.get("created_at", file_mtime),
             "completed_at": metadata.get("completed_at", file_mtime),
+            "duration": duration,
             "output_files": [str(f) for f in audio_files],
             "audio_files": [f.name for f in audio_files],
             "output_dir": str(subdir),
@@ -1358,6 +1570,9 @@ GENRE_TO_AUTO_PROMPT = {
     "chinese opera": "Chinese Opera",
 }
 
+# Configuration: Use model server for persistent VRAM loading
+USE_MODEL_SERVER = True  # Set to False to use old subprocess method
+
 async def run_generation(gen_id: str, request: SongRequest, reference_path: Optional[str]):
     """Run the actual SongGeneration inference."""
     global generations
@@ -1366,15 +1581,33 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         print(f"[GEN {gen_id}] Starting generation...")
         generations[gen_id]["status"] = "processing"
         generations[gen_id]["started_at"] = datetime.now().isoformat()  # Track actual start time
-        generations[gen_id]["message"] = "Preparing input..."
-        generations[gen_id]["progress"] = 5
+        generations[gen_id]["message"] = "Initializing..."
+        generations[gen_id]["progress"] = 0
+
+        # Notify model status changed (now in use)
+        notify_models_update()
+
+        # Calculate estimated time from history
+        model_id = request.model or DEFAULT_MODEL
+        num_sections = len(request.sections) if request.sections else 5
+        timing_stats = get_timing_stats()
+        estimated_seconds = 180  # Default: 3 minutes
+        if timing_stats.get("has_history") and model_id in timing_stats.get("models", {}):
+            model_timing = timing_stats["models"][model_id]
+            # Try to get estimate by section count first, then fall back to average
+            by_sections = model_timing.get("by_sections", {})
+            if str(num_sections) in by_sections:
+                estimated_seconds = by_sections[str(num_sections)]
+            else:
+                estimated_seconds = model_timing.get("avg_time", 180)
+        generations[gen_id]["estimated_seconds"] = estimated_seconds
+        print(f"[GEN {gen_id}] Estimated time: {estimated_seconds}s (based on timing history)")
 
         # Notify clients of status change
         notify_generation_update(gen_id, generations[gen_id])
         notify_library_update()
 
         # Validate model
-        model_id = request.model or DEFAULT_MODEL
         model_path = BASE_DIR / model_id
 
         if not model_path.exists():
@@ -1459,8 +1692,147 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
             json.dump(input_data, f, ensure_ascii=False)
             f.write('\n')
 
-        generations[gen_id]["message"] = f"Loading model ({model_id})..."
+        generations[gen_id]["message"] = "Loading Model..."
         generations[gen_id]["progress"] = 10
+        notify_generation_update(gen_id, generations[gen_id])
+
+        # =====================================================================
+        # MODEL SERVER PATH - Persistent model in VRAM for fast subsequent generations
+        # =====================================================================
+        if USE_MODEL_SERVER:
+            print(f"[GEN {gen_id}] Using model server for persistent VRAM...")
+
+            # Ensure model server is running
+            if not is_model_server_running():
+                generations[gen_id]["message"] = "Starting model server..."
+                notify_generation_update(gen_id, generations[gen_id])
+                if not start_model_server():
+                    raise Exception("Failed to start model server")
+
+            # Check if correct model is loaded
+            server_status = get_model_server_status()
+            if not server_status.get("loaded") or server_status.get("model_id") != model_id:
+                generations[gen_id]["message"] = "Loading Model..."
+                generations[gen_id]["progress"] = 15
+                notify_generation_update(gen_id, generations[gen_id])
+
+                # Request model load
+                load_result = load_model_on_server(model_id)
+                if "error" in load_result:
+                    raise Exception(f"Failed to load model: {load_result['error']}")
+
+                # Wait for model to load (up to 120 seconds)
+                for i in range(120):
+                    await asyncio.sleep(1)
+                    server_status = get_model_server_status()
+                    if server_status.get("loaded") and server_status.get("model_id") == model_id:
+                        print(f"[GEN {gen_id}] Model loaded in VRAM")
+                        break
+                    if server_status.get("error"):
+                        raise Exception(f"Model load failed: {server_status['error']}")
+                    # Update progress during loading
+                    generations[gen_id]["progress"] = min(30, 15 + i // 4)
+                    notify_generation_update(gen_id, generations[gen_id])
+                else:
+                    raise Exception("Model load timeout")
+            else:
+                print(f"[GEN {gen_id}] Model already loaded in VRAM - skipping load!")
+
+            # Generate via model server
+            generations[gen_id]["message"] = "Generating music..."
+            generations[gen_id]["progress"] = 35
+            generations[gen_id]["stage"] = "generating"
+            notify_generation_update(gen_id, generations[gen_id])
+            notify_models_update()
+
+            gen_type = request.output_mode or "mixed"
+            start_time = time.time()
+
+            # Run generation in thread pool to not block
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                generate_via_server,
+                str(input_file),
+                str(output_subdir),
+                gen_type
+            )
+
+            if "error" in result:
+                raise Exception(f"Generation failed: {result['error']}")
+
+            gen_time = time.time() - start_time
+            print(f"[GEN {gen_id}] Model server generation completed in {gen_time:.1f}s")
+
+            # Find output files
+            audios_dir = output_subdir / "audios"
+            output_files = list(audios_dir.glob("*.flac")) if audios_dir.exists() else []
+            if not output_files:
+                output_files = list(output_subdir.glob("*.flac"))
+
+            if not output_files:
+                raise Exception("No output files generated")
+
+            # Get audio duration
+            audio_duration = None
+            if output_files:
+                audio_duration = get_audio_duration(output_files[0])
+
+            # Mark as complete - skip to success handling below
+            generations[gen_id]["status"] = "completed"
+            generations[gen_id]["progress"] = 100
+            generations[gen_id]["message"] = "Song generated successfully!"
+            generations[gen_id]["output_files"] = [str(f) for f in output_files]
+            generations[gen_id]["output_file"] = str(output_files[0])
+            generations[gen_id]["completed_at"] = datetime.now().isoformat()
+            generations[gen_id]["duration"] = audio_duration
+
+            # Notify model status changed (no longer generating)
+            notify_models_update()
+
+            # Calculate and save timing
+            generation_time_seconds = int(gen_time)
+            total_lyrics_length = sum(len(s.lyrics or '') for s in request.sections)
+            num_sections = len(request.sections)
+            has_lyrics = total_lyrics_length > 0
+
+            # Save metadata
+            try:
+                metadata_path = output_subdir / "metadata.json"
+                metadata = {
+                    "id": gen_id,
+                    "title": request.title,
+                    "model": model_id,
+                    "created_at": generations[gen_id].get("created_at", datetime.now().isoformat()),
+                    "completed_at": generations[gen_id]["completed_at"],
+                    "generation_time_seconds": generation_time_seconds,
+                    "duration": audio_duration,
+                    "sections": [s.model_dump() for s in request.sections],
+                    "genre": request.genre,
+                    "gender": request.gender,
+                    "timbre": request.timbre,
+                    "output_mode": request.output_mode,
+                    "num_sections": num_sections,
+                    "has_lyrics": has_lyrics,
+                    "total_lyrics_length": total_lyrics_length,
+                    "used_model_server": True,
+                }
+                with open(metadata_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+                generations[gen_id]["metadata"] = metadata
+                save_timing_record(metadata)
+            except Exception as meta_err:
+                print(f"[GEN {gen_id}] Warning: Could not save metadata: {meta_err}")
+
+            input_file.unlink(missing_ok=True)
+            notify_generation_update(gen_id, generations[gen_id])
+            notify_library_update()
+            return  # Done with model server path
+
+        # =====================================================================
+        # SUBPROCESS PATH - Original method (fallback)
+        # =====================================================================
+        print(f"[GEN {gen_id}] Using subprocess method...")
 
         # Build command
         cmd = [
@@ -1514,6 +1886,7 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         pathsep = os.pathsep  # ; on Windows, : on Unix
         env["PYTHONPATH"] = f"{BASE_DIR}{pathsep}{flow_vae_dir}{pathsep}{env.get('PYTHONPATH', '')}"
         env["PYTHONUTF8"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"  # Force unbuffered output for real-time logging
         # Add advanced params to environment
         env.update(adv_params)
 
@@ -1529,11 +1902,22 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         # Store process reference for stop functionality
         running_processes[gen_id] = process
 
-        generations[gen_id]["message"] = "Generating..."
-        generations[gen_id]["progress"] = 20
+        generations[gen_id]["message"] = "Initializing model..."
+        generations[gen_id]["progress"] = 0
+        generations[gen_id]["stage"] = "init"  # Track current stage
 
         all_stderr = []
+        # =====================================================================
+        # PURE TIME-BASED PROGRESS MONITORING
+        # Progress = elapsed_time / estimated_time * 100
+        # Phase detection via simple keyword matching (no tqdm parsing)
+        # =====================================================================
         stopped = False
+        last_progress_update = -1
+        current_stage = "init"
+        start_time = time.time()
+        estimated_seconds = generations[gen_id].get("estimated_seconds", 180)
+
         while True:
             # Check if generation was stopped
             if generations[gen_id].get("status") == "stopped":
@@ -1547,38 +1931,85 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
                 break
 
             try:
-                line = await asyncio.wait_for(process.stderr.readline(), timeout=1.0)
-                if not line:
+                # Read stderr with short timeout for responsive progress
+                chunk = await asyncio.wait_for(process.stderr.read(4096), timeout=0.5)
+                if not chunk:
                     break
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                if line_str:
+
+                chunk_str = chunk.decode('utf-8', errors='ignore')
+
+                # Process lines for logging and phase detection
+                for line_str in chunk_str.split('\n'):
+                    line_str = line_str.strip()
+                    if not line_str:
+                        continue
+
+                    # Check tqdm lines for phase detection BEFORE skipping them
+                    is_tqdm = '%|' in line_str or 'it/s]' in line_str
+
+                    if is_tqdm:
+                        # Phase detection from tqdm progress bars
+                        if current_stage == "init":
+                            # Detect generation starting (tqdm shows /7000 or /6000 for LM steps)
+                            if '/7000' in line_str or '/6000' in line_str or '/5000' in line_str:
+                                current_stage = "generating"
+                                generations[gen_id]["message"] = "Generating music..."
+                                generations[gen_id]["stage"] = "generating"
+                                print(f"[GEN {gen_id}] Entered generation stage (detected tqdm)")
+                                notify_generation_update(gen_id, generations[gen_id])
+
+                        if current_stage == "generating":
+                            # Detect diffusion stage (tqdm shows /50 for diffusion steps)
+                            if '/50]' in line_str or '/50 ' in line_str:
+                                current_stage = "finalizing"
+                                generations[gen_id]["message"] = "Finalizing audio..."
+                                generations[gen_id]["stage"] = "finalizing"
+                                print(f"[GEN {gen_id}] Entered finalization stage (detected tqdm)")
+                                notify_generation_update(gen_id, generations[gen_id])
+                        continue  # Don't log tqdm lines
+
+                    # Log non-tqdm lines
                     log_line = line_str[:200] + '...' if len(line_str) > 200 else line_str
                     all_stderr.append(log_line)
                     print(f"[GEN {gen_id}] {log_line}")
 
-                    if "%" in line_str:
-                        match = re.search(r'(\d+)%', line_str)
-                        if match:
-                            pct = int(match.group(1))
-                            progress = min(95, 20 + (pct * 0.75))
-                            generations[gen_id]["progress"] = progress
-                            # Notify clients of progress (throttled - only every 5%)
-                            if pct % 5 == 0:
-                                notify_generation_update(gen_id, generations[gen_id])
+                    # Phase detection from regular log lines
+                    line_lower = line_str.lower()
+                    if current_stage == "init":
+                        # Detect model loaded, generation about to start
+                        if 'use generate' in line_lower:
+                            current_stage = "generating"
+                            generations[gen_id]["message"] = "Generating music..."
+                            generations[gen_id]["stage"] = "generating"
+                            print(f"[GEN {gen_id}] Entered generation stage (detected 'use generate')")
+                            notify_generation_update(gen_id, generations[gen_id])
+
+                    if current_stage != "finalizing":
+                        # Detect completion (lm cost appears after diffusion)
+                        if 'lm cost' in line_lower and 'diffusion cost' in line_lower:
+                            current_stage = "finalizing"
+                            generations[gen_id]["message"] = "Saving audio..."
+                            generations[gen_id]["stage"] = "finalizing"
+                            print(f"[GEN {gen_id}] Entered finalization stage (detected timing log)")
+                            notify_generation_update(gen_id, generations[gen_id])
+
             except asyncio.TimeoutError:
-                # Timeout on readline, just continue to check for stop
-                continue
-            except ValueError:
-                chunk = await process.stderr.read(8192)
-                if not chunk:
+                # Timeout - check if process ended
+                if process.returncode is not None:
                     break
-                chunk_str = chunk.decode('utf-8', errors='ignore')
-                if "%" in chunk_str:
-                    match = re.search(r'(\d+)%', chunk_str)
-                    if match:
-                        pct = int(match.group(1))
-                        progress = min(95, 20 + (pct * 0.75))
-                        generations[gen_id]["progress"] = progress
+
+            # Calculate time-based progress
+            elapsed = time.time() - start_time
+            if estimated_seconds > 0:
+                progress = min(95, (elapsed / estimated_seconds) * 100)  # Cap at 95% until done
+            else:
+                progress = min(95, elapsed / 180 * 100)  # Default 3 min estimate
+
+            # Update progress if changed significantly
+            if progress > last_progress_update + 1:
+                generations[gen_id]["progress"] = int(progress)
+                last_progress_update = progress
+                notify_generation_update(gen_id, generations[gen_id])
 
         # Clean up process reference
         running_processes.pop(gen_id, None)
@@ -1634,12 +2065,21 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
                 print(f"[GEN {gen_id}]   - {item.relative_to(output_subdir)}")
             raise Exception("No output file generated")
 
+        # Get audio duration
+        audio_duration = None
+        if output_files:
+            audio_duration = get_audio_duration(output_files[0])
+
         generations[gen_id]["status"] = "completed"
         generations[gen_id]["progress"] = 100
         generations[gen_id]["message"] = "Song generated successfully!"
         generations[gen_id]["output_files"] = [str(f) for f in output_files]
         generations[gen_id]["output_file"] = str(output_files[0])
         generations[gen_id]["completed_at"] = datetime.now().isoformat()
+        generations[gen_id]["duration"] = audio_duration
+
+        # Notify model status changed (no longer in use)
+        notify_models_update()
 
         # Calculate actual generation time
         generation_time_seconds = 0
@@ -1665,6 +2105,7 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
                 "created_at": generations[gen_id].get("created_at", datetime.now().isoformat()),
                 "completed_at": datetime.now().isoformat(),
                 "generation_time_seconds": generation_time_seconds,
+                "duration": audio_duration,
                 "gender": request.gender,
                 "timbre": request.timbre,
                 "genre": request.genre,
@@ -1716,6 +2157,7 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         # Notify clients of failure
         notify_generation_update(gen_id, generations[gen_id])
         notify_library_update()
+        notify_models_update()  # Model no longer in use
 
     # Background queue processor will automatically handle the next item
 
@@ -1831,6 +2273,52 @@ async def remove_model(model_id: str):
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result
+
+# ============================================================================
+# Model Server Endpoints (Persistent VRAM)
+# ============================================================================
+
+@app.get("/api/model-server/status")
+async def model_server_status():
+    """Get model server status."""
+    running = is_model_server_running()
+    status = get_model_server_status() if running else {"loaded": False}
+    return {
+        "running": running,
+        **status
+    }
+
+@app.post("/api/model-server/start")
+async def start_server():
+    """Start the model server."""
+    if is_model_server_running():
+        return {"status": "already_running"}
+    success = start_model_server()
+    return {"status": "started" if success else "failed"}
+
+@app.post("/api/model-server/stop")
+async def stop_server():
+    """Stop the model server and free VRAM."""
+    stop_model_server()
+    return {"status": "stopped"}
+
+@app.post("/api/model-server/load/{model_id}")
+async def load_model_endpoint(model_id: str):
+    """Load a model into VRAM via model server."""
+    if not is_model_server_running():
+        if not start_model_server():
+            raise HTTPException(500, "Failed to start model server")
+    result = load_model_on_server(model_id)
+    return result
+
+@app.post("/api/model-server/unload")
+async def unload_model_endpoint():
+    """Unload model from VRAM."""
+    try:
+        resp = requests.post(f"{MODEL_SERVER_URL}/unload", timeout=10)
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.post("/api/upload-reference")
 async def upload_reference(file: UploadFile = File(...)):
@@ -1988,6 +2476,7 @@ async def stop_generation(gen_id: str):
     # Notify clients
     notify_generation_update(gen_id, generations[gen_id])
     notify_library_update()
+    notify_models_update()  # Model no longer in use
 
     return {"status": "stopped", "message": "Generation stop requested"}
 

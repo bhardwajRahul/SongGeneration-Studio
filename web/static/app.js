@@ -58,6 +58,7 @@ var App = () => {
     const [queue, setQueue] = useState([]);
     const [currentGenId, setCurrentGenId] = useState(null);
     const [currentGenPayload, setCurrentGenPayload] = useState(null);
+    const currentGenIdRef = useRef(null);  // Ref to track currentGenId for SSE closure
     const pollRef = useRef(null);
     const addBtnRef = useRef(null);
     const timerRef = useRef(null);
@@ -81,6 +82,11 @@ var App = () => {
     // SSE connection for real-time updates
     const sseRef = useRef(null);
     const sseReconnectRef = useRef(null);
+
+    // Keep ref in sync with state for SSE closure access
+    useEffect(() => {
+        currentGenIdRef.current = currentGenId;
+    }, [currentGenId]);
 
     // Connect to Server-Sent Events for real-time updates
     useEffect(() => {
@@ -136,8 +142,8 @@ var App = () => {
                     const data = JSON.parse(e.data);
                     if (data.generation && data.id) {
                         const gen = data.generation;
-                        // Update progress if this is the current generation
-                        if (data.id === currentGenId) {
+                        // Update progress if this is the current generation (use ref for fresh value)
+                        if (data.id === currentGenIdRef.current) {
                             setProgress(gen.progress || 0);
                             setStatus(gen.message || '');
                             if (typeof gen.elapsed_seconds === 'number') {
@@ -160,16 +166,16 @@ var App = () => {
                 try {
                     const data = JSON.parse(e.data);
                     if (data.generations) {
-                        // Check if any generation is now active that we should track
+                        // Check if any generation is now active that we should track (use ref for fresh value)
                         const activeGen = data.generations.find(g => g.status === 'pending' || g.status === 'processing');
-                        if (activeGen && !currentGenId && !generating) {
+                        if (activeGen && !currentGenIdRef.current) {
                             console.log('[SSE] Detected active generation:', activeGen.id);
                             // Refresh library to get full data and trigger restoration
                             loadLibrary();
                         }
-                        // Check if current generation completed
-                        if (currentGenId) {
-                            const current = data.generations.find(g => g.id === currentGenId);
+                        // Check if current generation completed (use ref for fresh value)
+                        if (currentGenIdRef.current) {
+                            const current = data.generations.find(g => g.id === currentGenIdRef.current);
                             if (current && (current.status === 'completed' || current.status === 'failed' || current.status === 'stopped')) {
                                 loadLibrary();
                             }
@@ -595,6 +601,18 @@ var App = () => {
                 setGpuInfo(d);
             }
         } catch (e) { console.error(e); }
+    };
+
+    const unloadModel = async () => {
+        try {
+            const r = await fetch('/api/model-server/unload', { method: 'POST' });
+            if (r.ok) {
+                console.log('[MODEL] Model unloaded from VRAM');
+                // Refresh models to update warmth status
+                loadModels();
+                loadGpuInfo();
+            }
+        } catch (e) { console.error('[MODEL] Error unloading model:', e); }
     };
 
     const loadTimingStats = async () => {
@@ -1064,24 +1082,102 @@ var App = () => {
                         {/* Model */}
                         <Card>
                             <CardTitle>Model</CardTitle>
-                            {/* Model selector - only ready models */}
-                            {hasReadyModel ? (
-                                <div style={{ position: 'relative', marginBottom: '12px' }}>
-                                    <select
-                                        className="custom-select input-base"
-                                        value={selectedModel}
-                                        onChange={e => setSelectedModel(e.target.value)}
-                                        style={{ paddingRight: '40px', cursor: 'pointer' }}
-                                    >
-                                        {models.map(m => (
-                                            <option key={m.id} value={m.id}>{m.name}</option>
-                                        ))}
-                                    </select>
-                                    <div style={{ position: 'absolute', right: '14px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
-                                        <ChevronIcon />
+                            {/* Model selector - show loading state or ready models */}
+                            {(hasReadyModel || isInitializing) ? (
+                                <>
+                                    <div style={{ position: 'relative', marginBottom: '8px' }}>
+                                        <select
+                                            className="custom-select input-base"
+                                            value={isInitializing ? '' : selectedModel}
+                                            onChange={e => setSelectedModel(e.target.value)}
+                                            disabled={isInitializing}
+                                            style={{ paddingRight: '40px', cursor: isInitializing ? 'wait' : 'pointer', opacity: isInitializing ? 0.7 : 1 }}
+                                        >
+                                            {isInitializing ? (
+                                                <option value="">Loading...</option>
+                                            ) : (
+                                                models.map(m => (
+                                                    <option key={m.id} value={m.id}>{m.name}</option>
+                                                ))
+                                            )}
+                                        </select>
+                                        <div style={{ position: 'absolute', right: '14px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
+                                            {isInitializing ? <SpinnerIcon /> : <ChevronIcon />}
+                                        </div>
                                     </div>
-                                </div>
-                            ) : isInitializing || autoDownloadStarting ? (
+                                    {/* Model VRAM status indicator - hide during initialization */}
+                                    {!isInitializing && (() => {
+                                        const currentModel = models.find(m => m.id === selectedModel);
+                                        const warmth = currentModel?.warmth || 'not_loaded';
+                                        const styles = {
+                                            loaded: { bg: 'rgba(34, 197, 94, 0.15)', border: 'rgba(34, 197, 94, 0.4)', text: '#22C55E', label: 'Loaded in VRAM', hint: '' },
+                                            generating: { bg: 'rgba(99, 102, 241, 0.15)', border: 'rgba(99, 102, 241, 0.4)', text: '#6366F1', label: 'Generating...', hint: '' },
+                                            loading: { bg: 'rgba(251, 191, 36, 0.15)', border: 'rgba(251, 191, 36, 0.4)', text: '#F59E0B', label: 'Loading Model in VRAM...', hint: '' },
+                                            not_loaded: { bg: 'rgba(100, 116, 139, 0.1)', border: 'rgba(100, 116, 139, 0.2)', text: '#64748B', label: 'Not loaded', hint: '' },
+                                        };
+                                        const style = styles[warmth] || styles.not_loaded;
+                                        const isPulsing = warmth === 'generating' || warmth === 'loading';
+                                        const canEject = warmth === 'loaded';
+                                        return (
+                                            <div style={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: '6px',
+                                                marginBottom: '12px',
+                                                padding: '6px 10px',
+                                                backgroundColor: style.bg,
+                                                border: `1px solid ${style.border}`,
+                                                borderRadius: '6px',
+                                                fontSize: '11px',
+                                            }}>
+                                                <div style={{
+                                                    width: '6px',
+                                                    height: '6px',
+                                                    borderRadius: '50%',
+                                                    backgroundColor: style.text,
+                                                    animation: isPulsing ? 'pulse 1.5s ease-in-out infinite' : 'none',
+                                                }} />
+                                                <span style={{ color: style.text, fontWeight: '500' }}>
+                                                    {style.label}
+                                                </span>
+                                                {style.hint && (
+                                                    <span style={{ color: '#64748B', marginLeft: 'auto', fontSize: '10px' }}>
+                                                        {style.hint}
+                                                    </span>
+                                                )}
+                                                {canEject && (
+                                                    <button
+                                                        onClick={unloadModel}
+                                                        title="Unload model from VRAM"
+                                                        style={{
+                                                            marginLeft: 'auto',
+                                                            background: 'none',
+                                                            border: 'none',
+                                                            padding: '2px 6px',
+                                                            cursor: 'pointer',
+                                                            color: '#64748B',
+                                                            fontSize: '10px',
+                                                            borderRadius: '4px',
+                                                            display: 'flex',
+                                                            alignItems: 'center',
+                                                            gap: '3px',
+                                                        }}
+                                                        onMouseOver={e => e.currentTarget.style.backgroundColor = 'rgba(100,116,139,0.2)'}
+                                                        onMouseOut={e => e.currentTarget.style.backgroundColor = 'transparent'}
+                                                    >
+                                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                                                            <polyline points="16 17 21 12 16 7" />
+                                                            <line x1="21" y1="12" x2="9" y2="12" />
+                                                        </svg>
+                                                        Eject
+                                                    </button>
+                                                )}
+                                            </div>
+                                        );
+                                    })()}
+                                </>
+                            ) : autoDownloadStarting ? (
                                 <div style={{
                                     backgroundColor: 'rgba(99, 102, 241, 0.1)',
                                     border: '1px solid rgba(99, 102, 241, 0.3)',
@@ -1093,7 +1189,7 @@ var App = () => {
                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
                                         <SpinnerIcon />
                                         <span style={{ color: '#6366F1', fontSize: '13px', fontWeight: '500' }}>
-                                            {autoDownloadStarting ? 'Starting download...' : 'Loading models...'}
+                                            Starting download...
                                         </span>
                                     </div>
                                 </div>
@@ -1249,7 +1345,12 @@ var App = () => {
                                 const canRunLow = freeVram >= reqs.low;
                                 const canRunHigh = freeVram >= highVramNeeded;
 
-                                if (!canRunLow) {
+                                // Check if model is already loaded in VRAM
+                                const currentModelForVram = models.find(m => m.id === selectedModel);
+                                const modelIsLoaded = currentModelForVram?.warmth === 'loaded' || currentModelForVram?.warmth === 'generating';
+
+                                // Don't show insufficient VRAM if model is already loaded
+                                if (!canRunLow && !modelIsLoaded) {
                                     return (
                                         <div style={{
                                             backgroundColor: 'rgba(239, 68, 68, 0.1)',
@@ -1828,8 +1929,11 @@ var App = () => {
                                                     <div className="text-sm font-medium text-primary truncate" style={{ marginBottom: '2px' }}>
                                                         {currentGenPayload.title || 'Untitled'}
                                                     </div>
-                                                    <div className="text-xs text-secondary">
-                                                        {formatTime(elapsedTime)}{estimatedTime > 0 ? ` / ~${formatTime(estimatedTime)}` : ''}
+                                                    <div className="text-xs text-secondary" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                                        <span>{status || 'Generating...'}</span>
+                                                        <span style={{ opacity: 0.7, marginLeft: '8px', flexShrink: 0 }}>
+                                                            {formatTime(elapsedTime)}{estimatedTime > 0 ? ` / ~${formatTime(estimatedTime)}` : ''}
+                                                        </span>
                                                     </div>
                                                 </div>
                                             </div>
@@ -1947,7 +2051,7 @@ var App = () => {
                                                             {isProcessing ? 'Generating...' : ([meta.genre, meta.emotion].filter(Boolean).join(' • ') || 'No tags')}
                                                         </div>
                                                         <div className="text-xs text-muted">
-                                                            {new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                            {(item.duration || meta.duration) ? formatTime(item.duration || meta.duration) : '--:--'}
                                                         </div>
                                                     </div>
                                                 </div>
