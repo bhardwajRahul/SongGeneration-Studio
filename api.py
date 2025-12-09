@@ -921,7 +921,7 @@ def kill_process_on_port(port: int) -> bool:
 def get_model_server_status() -> dict:
     """Get model server status including loaded model info."""
     try:
-        resp = requests.get(f"{MODEL_SERVER_URL}/status", timeout=0.5)
+        resp = requests.get(f"{MODEL_SERVER_URL}/status", timeout=2)
         if resp.status_code == 200:
             return resp.json()
     except:
