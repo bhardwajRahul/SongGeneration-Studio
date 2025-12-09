@@ -1030,12 +1030,16 @@ MODEL_SERVER_URL = f"http://127.0.0.1:{MODEL_SERVER_PORT}"
 model_server_process: Optional[subprocess.Popen] = None
 
 def is_model_server_running() -> bool:
-    """Check if model server is running and responsive."""
+    """Check if model server is running and responsive (blocking)."""
     try:
         resp = requests.get(f"{MODEL_SERVER_URL}/health", timeout=2)
         return resp.status_code == 200
     except:
         return False
+
+async def is_model_server_running_async() -> bool:
+    """Check if model server is running (non-blocking)."""
+    return await asyncio.to_thread(is_model_server_running)
 
 def kill_process_on_port(port: int) -> bool:
     """Kill any process using the specified port."""
@@ -1080,7 +1084,7 @@ def kill_process_on_port(port: int) -> bool:
     return False
 
 def get_model_server_status() -> dict:
-    """Get model server status including loaded model info."""
+    """Get model server status including loaded model info (blocking)."""
     try:
         resp = requests.get(f"{MODEL_SERVER_URL}/status", timeout=2)
         if resp.status_code == 200:
@@ -1093,6 +1097,10 @@ def get_model_server_status() -> dict:
     except Exception as e:
         print(f"[MODEL_SERVER] Status check error: {e}")
     return {"loaded": False, "running": False}
+
+async def get_model_server_status_async() -> dict:
+    """Get model server status (non-blocking)."""
+    return await asyncio.to_thread(get_model_server_status)
 
 # Model status tracking - check actual model server status
 def get_model_warmth(model_id: str) -> str:
@@ -1233,13 +1241,13 @@ async def start_model_server(preload_model: str = None) -> bool:
     """Start the model server process (async - doesn't block event loop)."""
     global model_server_process
 
-    if is_model_server_running():
+    if await is_model_server_running_async():
         print("[MODEL_SERVER] Already running", flush=True)
         return True
 
     # Kill any orphaned process on the port before starting
     # This handles cases where previous server hung/crashed but port is still bound
-    kill_process_on_port(MODEL_SERVER_PORT)
+    await asyncio.to_thread(kill_process_on_port, MODEL_SERVER_PORT)
 
     print("[MODEL_SERVER] Starting model server...", flush=True)
 
@@ -1289,7 +1297,7 @@ async def start_model_server(preload_model: str = None) -> bool:
                 print(f"[MODEL_SERVER] Process exited with code {model_server_process.returncode}", flush=True)
                 return False
 
-            if is_model_server_running():
+            if await is_model_server_running_async():
                 print(f"[MODEL_SERVER] Server started successfully after {i+1}s", flush=True)
                 return True
 
@@ -1323,7 +1331,7 @@ def stop_model_server():
         print("[MODEL_SERVER] Server stopped")
 
 def load_model_on_server(model_id: str) -> dict:
-    """Request model server to load a model."""
+    """Request model server to load a model (blocking)."""
     try:
         resp = requests.post(f"{MODEL_SERVER_URL}/load",
                            json={"model_id": model_id}, timeout=5)
@@ -1331,8 +1339,12 @@ def load_model_on_server(model_id: str) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+async def load_model_on_server_async(model_id: str) -> dict:
+    """Request model server to load a model (non-blocking)."""
+    return await asyncio.to_thread(load_model_on_server, model_id)
+
 def generate_via_server(input_jsonl: str, save_dir: str, gen_type: str = "mixed") -> dict:
-    """Send generation request to model server."""
+    """Send generation request to model server (blocking)."""
     try:
         resp = requests.post(f"{MODEL_SERVER_URL}/generate",
                            json={
@@ -1343,6 +1355,10 @@ def generate_via_server(input_jsonl: str, save_dir: str, gen_type: str = "mixed"
         return resp.json()
     except Exception as e:
         return {"error": str(e)}
+
+async def generate_via_server_async(input_jsonl: str, save_dir: str, gen_type: str = "mixed") -> dict:
+    """Send generation request to model server (non-blocking)."""
+    return await asyncio.to_thread(generate_via_server, input_jsonl, save_dir, gen_type)
 
 # ============================================================================
 # State
@@ -1916,29 +1932,29 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
         if USE_MODEL_SERVER:
             print(f"[GEN {gen_id}] Using model server for persistent VRAM...")
 
-            # Ensure model server is running
-            if not is_model_server_running():
+            # Ensure model server is running (async - doesn't block event loop)
+            if not await is_model_server_running_async():
                 generations[gen_id]["message"] = "Starting model server..."
                 notify_generation_update(gen_id, generations[gen_id])
                 if not await start_model_server():
                     raise Exception("Failed to start model server")
 
-            # Check if correct model is loaded
-            server_status = get_model_server_status()
+            # Check if correct model is loaded (async)
+            server_status = await get_model_server_status_async()
             if not server_status.get("loaded") or server_status.get("model_id") != model_id:
                 generations[gen_id]["message"] = "Loading Model..."
                 generations[gen_id]["progress"] = 15
                 notify_generation_update(gen_id, generations[gen_id])
 
-                # Request model load
-                load_result = load_model_on_server(model_id)
+                # Request model load (async)
+                load_result = await load_model_on_server_async(model_id)
                 if "error" in load_result:
                     raise Exception(f"Failed to load model: {load_result['error']}")
 
                 # Wait for model to load (up to 300 seconds / 5 minutes)
                 for i in range(300):
                     await asyncio.sleep(1)
-                    server_status = get_model_server_status()
+                    server_status = await get_model_server_status_async()
                     if server_status.get("loaded") and server_status.get("model_id") == model_id:
                         print(f"[GEN {gen_id}] Model loaded in VRAM")
                         break
@@ -1962,11 +1978,8 @@ async def run_generation(gen_id: str, request: SongRequest, reference_path: Opti
             gen_type = request.output_mode or "mixed"
             start_time = time.time()
 
-            # Run generation in thread pool to not block
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                generate_via_server,
+            # Run generation in thread pool to not block event loop
+            result = await generate_via_server_async(
                 str(input_file),
                 str(output_subdir),
                 gen_type
@@ -2495,8 +2508,8 @@ async def remove_model(model_id: str):
 @app.get("/api/model-server/status")
 async def model_server_status():
     """Get model server status."""
-    running = is_model_server_running()
-    status = get_model_server_status() if running else {"loaded": False}
+    running = await is_model_server_running_async()
+    status = await get_model_server_status_async() if running else {"loaded": False}
     return {
         "running": running,
         **status
@@ -2505,7 +2518,7 @@ async def model_server_status():
 @app.post("/api/model-server/start")
 async def start_server():
     """Start the model server."""
-    if is_model_server_running():
+    if await is_model_server_running_async():
         return {"status": "already_running"}
     success = await start_model_server()
     return {"status": "started" if success else "failed"}
@@ -2513,23 +2526,25 @@ async def start_server():
 @app.post("/api/model-server/stop")
 async def stop_server():
     """Stop the model server and free VRAM."""
-    stop_model_server()
+    await asyncio.to_thread(stop_model_server)
     return {"status": "stopped"}
 
 @app.post("/api/model-server/load/{model_id}")
 async def load_model_endpoint(model_id: str):
     """Load a model into VRAM via model server."""
-    if not is_model_server_running():
+    if not await is_model_server_running_async():
         if not await start_model_server():
             raise HTTPException(500, "Failed to start model server")
-    result = load_model_on_server(model_id)
+    result = await load_model_on_server_async(model_id)
     return result
 
 @app.post("/api/model-server/unload")
 async def unload_model_endpoint():
     """Unload model from VRAM."""
+    def _unload():
+        return requests.post(f"{MODEL_SERVER_URL}/unload", timeout=10)
     try:
-        resp = requests.post(f"{MODEL_SERVER_URL}/unload", timeout=10)
+        resp = await asyncio.to_thread(_unload)
         return resp.json()
     except Exception as e:
         raise HTTPException(500, str(e))
