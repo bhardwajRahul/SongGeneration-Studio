@@ -36,8 +36,7 @@ module.exports = {
         ]
       }
     },
-    // 4. Sync custom files from root to app/
-    // This copies our custom code over the upstream repo
+    // 4. Sync custom Python files from root to app/
     { method: "fs.copy", params: { src: "main.py", dest: "app/main.py" } },
     { method: "fs.copy", params: { src: "generation.py", dest: "app/generation.py" } },
     { method: "fs.copy", params: { src: "model_server.py", dest: "app/model_server.py" } },
@@ -47,6 +46,7 @@ module.exports = {
     { method: "fs.copy", params: { src: "schemas.py", dest: "app/schemas.py" } },
     { method: "fs.copy", params: { src: "sse.py", dest: "app/sse.py" } },
     { method: "fs.copy", params: { src: "timing.py", dest: "app/timing.py" } },
+    // 5. Sync custom web files from root to app/
     { method: "fs.copy", params: { src: "web/static/index.html", dest: "app/web/static/index.html" } },
     { method: "fs.copy", params: { src: "web/static/styles.css", dest: "app/web/static/styles.css" } },
     { method: "fs.copy", params: { src: "web/static/app.js", dest: "app/web/static/app.js" } },
@@ -57,7 +57,7 @@ module.exports = {
     { method: "fs.copy", params: { src: "web/static/icons.js", dest: "app/web/static/icons.js" } },
     { method: "fs.copy", params: { src: "web/static/Logo_1.png", dest: "app/web/static/Logo_1.png" } },
     { method: "fs.copy", params: { src: "web/static/default.jpg", dest: "app/web/static/default.jpg" } },
-    // 5. Apply patches (flash attention fix for Windows compatibility)
+    // 6. Apply flash attention fix for Windows compatibility
     { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } }
   ]
 }
