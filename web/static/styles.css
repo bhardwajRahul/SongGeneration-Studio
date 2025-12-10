@@ -1,5 +1,7 @@
 /* CSS Variables for consistent theming */
 :root {
+    color-scheme: dark;
+
     /* Primary colors */
     --color-primary: #10B981;
     --color-primary-light: #10B98130;
@@ -69,6 +71,21 @@ input[type="range"]::-webkit-slider-thumb {
     background: var(--color-primary);
     border-radius: 50%;
     cursor: pointer;
+}
+
+/* Text input with numeric styling */
+input[type="text"][inputmode="numeric"] {
+    background-color: var(--bg-input);
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
+    color: var(--color-primary);
+    padding: 6px 8px;
+    font-size: 13px;
+    font-weight: 600;
+    outline: none;
+}
+input[type="text"][inputmode="numeric"]:focus {
+    border-color: var(--color-primary);
 }
 
 select {
@@ -375,4 +392,39 @@ textarea::placeholder, input::placeholder {
 
 .album-cover:hover .album-cover-overlay {
     opacity: 1;
+}
+
+/* Song thumbnail hover (Songs panel) */
+.song-thumb-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.5);
+    border-radius: 6px;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.song-thumb-hover:hover .song-thumb-overlay {
+    opacity: 1;
+}
+
+/* Section pill drag and drop */
+.section-pill {
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.section-pill:active {
+    cursor: grabbing;
+}
+
+.section-pill.dragging {
+    opacity: 0.4 !important;
+    transform: scale(0.95) !important;
 }

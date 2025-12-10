@@ -1,170 +1,5 @@
-// SongGeneration Studio - React Components
-// This file contains reusable UI components
-
-var { useState, useEffect, useRef, useCallback } = React;
-
-// Shared utility function for formatting time
-var formatTime = (seconds) => {
-    if (!seconds || isNaN(seconds)) return '0:00';
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
-};
-
-// Model generation time estimates (in seconds)
-var MODEL_BASE_TIMES = {
-    'songgeneration_base': 180,
-    'songgeneration_base_new': 200,
-    'songgeneration_base_full': 300,
-    'songgeneration_large': 420,
-};
-
-// Custom hook for hover state
-var useHover = () => {
-    const [isHovered, setIsHovered] = useState(false);
-    const handlers = {
-        onMouseEnter: () => setIsHovered(true),
-        onMouseLeave: () => setIsHovered(false),
-    };
-    return [isHovered, handlers];
-};
-
-// Scrollbar style helper
-var getScrollStyle = (isHovered) => ({
-    scrollbarWidth: 'thin',
-    scrollbarColor: isHovered ? '#3a3a3a transparent' : 'transparent transparent',
-});
-
-// Reusable Icon components
-var PlayIcon = ({ size = 12, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 12 12" fill={color}>
-        <path d="M2 1.5v9l8-4.5-8-4.5z" />
-    </svg>
-);
-
-var PauseIcon = ({ size = 12, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 12 12" fill={color}>
-        <rect x="2" y="1" width="3" height="10" rx="1" />
-        <rect x="7" y="1" width="3" height="10" rx="1" />
-    </svg>
-);
-
-var CloseIcon = ({ size = 12, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M18 6L6 18M6 6l12 12"/>
-    </svg>
-);
-
-var MusicNoteIcon = ({ size = 24, color = '#666' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M9 18V5l12-2v13"/>
-        <circle cx="6" cy="18" r="3"/>
-        <circle cx="18" cy="16" r="3"/>
-    </svg>
-);
-
-var ExpandIcon = ({ size = 12, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
-    </svg>
-);
-
-var ChevronIcon = ({ size = 16, color = '#888', rotated = false }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ transition: 'transform 0.2s', transform: rotated ? 'rotate(180deg)' : 'rotate(0deg)' }}>
-        <path d="M6 9l6 6 6-6"/>
-    </svg>
-);
-
-var VolumeIcon = ({ size = 16, color = '#666' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
-        <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
-    </svg>
-);
-
-var VolumeFullIcon = ({ size = 18, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M11 5L6 9H2v6h4l5 4V5z"/>
-        <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
-    </svg>
-);
-
-var VolumeMuteIcon = ({ size = 18, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M11 5L6 9H2v6h4l5 4V5z"/>
-        <line x1="23" y1="9" x2="17" y2="15"/>
-        <line x1="17" y1="9" x2="23" y2="15"/>
-    </svg>
-);
-
-var PlusIcon = ({ size = 16, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M12 5v14M5 12h14"/>
-    </svg>
-);
-
-var TrashIcon = ({ size = 10, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-    </svg>
-);
-
-var EditIcon = ({ size = 14, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-    </svg>
-);
-
-var SkipBackIcon = ({ size = 20, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
-        <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/>
-    </svg>
-);
-
-var SkipForwardIcon = ({ size = 20, color = 'currentColor' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
-        <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
-    </svg>
-);
-
-var PlayLargeIcon = ({ size = 24, color = '#fff', style = {} }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill={color} style={style}>
-        <path d="M8 5v14l11-7z"/>
-    </svg>
-);
-
-var PauseLargeIcon = ({ size = 24, color = '#fff' }) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill={color}>
-        <rect x="6" y="4" width="4" height="16"/>
-        <rect x="14" y="4" width="4" height="16"/>
-    </svg>
-);
-
-var SpinnerIcon = ({ size = 24 }) => (
-    <div style={{ width: size, height: size, border: '2px solid #fff', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
-);
-
-// Section type configurations
-var SECTION_TYPES = {
-    'intro': { name: 'Intro', color: '#8B5CF6', hasLyrics: false, hasDuration: true },
-    'verse': { name: 'Verse', color: '#3B82F6', hasLyrics: true, hasDuration: false },
-    'chorus': { name: 'Chorus', color: '#F59E0B', hasLyrics: true, hasDuration: false },
-    'bridge': { name: 'Bridge', color: '#EC4899', hasLyrics: true, hasDuration: false },
-    'inst': { name: 'Inst', color: '#10B981', hasLyrics: false, hasDuration: true },
-    'outro': { name: 'Outro', color: '#EAB308', hasLyrics: false, hasDuration: true },
-};
-
-// Suggestion lists
-var GENRE_SUGGESTIONS = ['Pop', 'Rock', 'Metal', 'Jazz', 'R&B', 'Folk', 'Dance', 'Electronic', 'Hip Hop', 'Trap', 'Lo-fi', 'Synthwave', 'Punk', 'Blues', 'Country', 'Ambient', 'Soul', 'Funk', 'Reggae', 'Indie', 'EDM', 'Dubstep', 'House', 'Techno', 'Drum and Bass', 'Classical', 'Opera', 'Gospel', 'Ska', 'Grunge', 'Disco', 'New Wave', 'Shoegaze', 'Post-rock', 'Hardcore', 'Emo'];
-var MOOD_SUGGESTIONS = ['happy', 'sad', 'energetic', 'romantic', 'angry', 'peaceful', 'melancholic', 'hopeful', 'aggressive', 'dreamy', 'nostalgic', 'euphoric', 'dark', 'chill', 'epic', 'intense', 'uplifting', 'mysterious', 'playful', 'haunting'];
-var TIMBRE_SUGGESTIONS = ['bright', 'dark', 'soft', 'powerful', 'warm', 'clear', 'raspy', 'smooth', 'breathy', 'ethereal', 'gravelly', 'operatic', 'distorted', 'clean', 'raw', 'polished'];
-var INSTRUMENT_SUGGESTIONS = ['piano', 'guitar', 'drums', 'bass', 'synth', 'strings', 'violin', 'cello', 'saxophone', 'trumpet', 'flute', 'organ', 'harp', 'percussion', 'choir', 'orchestra'];
-
-// Helper function to parse section types
-var fromApiType = (apiType) => {
-    const match = apiType.match(/^(.+?)(?:-(short|medium|long))?$/);
-    return match ? { base: match[1], duration: match[2] || 'short' } : { base: apiType, duration: null };
-};
+// SongGeneration Studio - UI Components
+// Dependencies: constants.js, icons.js (loaded before this file)
 
 // Custom dark audio player component
 var DarkAudioPlayer = ({ src }) => {
@@ -750,15 +585,68 @@ var AudioTrimmer = ({ onAccept, onClear, onFileLoad }) => {
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
                     <span style={{ fontSize: '12px', color: '#666' }}>Clip Duration</span>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <input
-                            type="number"
-                            min="1"
-                            max={Math.floor(totalDuration) || 60}
-                            value={clipDuration}
-                            onChange={e => handleDurationChange(parseInt(e.target.value) || 1)}
-                            className="input-base input-small"
-                            style={{ width: '50px', color: '#10B981', textAlign: 'center' }}
-                        />
+                        <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            background: '#1e1e1e',
+                            border: '1px solid #3a3a3a',
+                            borderRadius: '6px',
+                            overflow: 'hidden'
+                        }}>
+                            <input
+                                type="text"
+                                value={clipDuration}
+                                onChange={e => {
+                                    const val = parseInt(e.target.value) || 1;
+                                    const max = Math.floor(totalDuration) || 60;
+                                    handleDurationChange(Math.min(Math.max(1, val), max));
+                                }}
+                                style={{
+                                    width: '36px',
+                                    textAlign: 'center',
+                                    background: 'transparent',
+                                    border: 'none',
+                                    color: '#10B981',
+                                    fontSize: '13px',
+                                    fontWeight: '600',
+                                    outline: 'none',
+                                    padding: '6px 4px'
+                                }}
+                            />
+                            <div style={{ display: 'flex', flexDirection: 'column', borderLeft: '1px solid #3a3a3a' }}>
+                                <button
+                                    onClick={() => handleDurationChange(Math.min(clipDuration + 1, Math.floor(totalDuration) || 60))}
+                                    style={{
+                                        background: 'transparent',
+                                        border: 'none',
+                                        color: '#888',
+                                        cursor: 'pointer',
+                                        padding: '2px 6px',
+                                        fontSize: '8px',
+                                        lineHeight: 1,
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center'
+                                    }}
+                                >▲</button>
+                                <button
+                                    onClick={() => handleDurationChange(Math.max(clipDuration - 1, 1))}
+                                    style={{
+                                        background: 'transparent',
+                                        border: 'none',
+                                        borderTop: '1px solid #3a3a3a',
+                                        color: '#888',
+                                        cursor: 'pointer',
+                                        padding: '2px 6px',
+                                        fontSize: '8px',
+                                        lineHeight: 1,
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center'
+                                    }}
+                                >▼</button>
+                            </div>
+                        </div>
                         <span style={{ fontSize: '12px', color: '#666' }}>seconds</span>
                     </div>
                 </div>
@@ -971,15 +859,68 @@ var AudioTrimmer = ({ onAccept, onClear, onFileLoad }) => {
                             <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                     <span style={{ fontSize: '13px', color: '#888' }}>Clip Duration:</span>
-                                    <input
-                                        type="number"
-                                        min="1"
-                                        max={Math.floor(totalDuration) || 60}
-                                        value={clipDuration}
-                                        onChange={e => handleDurationChange(parseInt(e.target.value) || 1)}
-                                        className="input-base input-small"
-                                        style={{ width: '60px', color: '#10B981', textAlign: 'center', fontSize: '14px' }}
-                                    />
+                                    <div style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        background: '#1e1e1e',
+                                        border: '1px solid #3a3a3a',
+                                        borderRadius: '6px',
+                                        overflow: 'hidden'
+                                    }}>
+                                        <input
+                                            type="text"
+                                            value={clipDuration}
+                                            onChange={e => {
+                                                const val = parseInt(e.target.value) || 1;
+                                                const max = Math.floor(totalDuration) || 60;
+                                                handleDurationChange(Math.min(Math.max(1, val), max));
+                                            }}
+                                            style={{
+                                                width: '40px',
+                                                textAlign: 'center',
+                                                background: 'transparent',
+                                                border: 'none',
+                                                color: '#10B981',
+                                                fontSize: '14px',
+                                                fontWeight: '600',
+                                                outline: 'none',
+                                                padding: '6px 4px'
+                                            }}
+                                        />
+                                        <div style={{ display: 'flex', flexDirection: 'column', borderLeft: '1px solid #3a3a3a' }}>
+                                            <button
+                                                onClick={() => handleDurationChange(Math.min(clipDuration + 1, Math.floor(totalDuration) || 60))}
+                                                style={{
+                                                    background: 'transparent',
+                                                    border: 'none',
+                                                    color: '#888',
+                                                    cursor: 'pointer',
+                                                    padding: '2px 6px',
+                                                    fontSize: '8px',
+                                                    lineHeight: 1,
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'center'
+                                                }}
+                                            >▲</button>
+                                            <button
+                                                onClick={() => handleDurationChange(Math.max(clipDuration - 1, 1))}
+                                                style={{
+                                                    background: 'transparent',
+                                                    border: 'none',
+                                                    borderTop: '1px solid #3a3a3a',
+                                                    color: '#888',
+                                                    cursor: 'pointer',
+                                                    padding: '2px 6px',
+                                                    fontSize: '8px',
+                                                    lineHeight: 1,
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'center'
+                                                }}
+                                            >▼</button>
+                                        </div>
+                                    </div>
                                     <span style={{ fontSize: '13px', color: '#888' }}>sec</span>
                                 </div>
                                 <div style={{ fontSize: '14px', color: '#10B981', fontWeight: '500' }}>
@@ -1220,33 +1161,23 @@ var EditModal = ({ item, onClose, onSave }) => {
     const [coverPreview, setCoverPreview] = useState(null);
     const [coverFile, setCoverFile] = useState(null);
     const [saving, setSaving] = useState(false);
+    const [error, setError] = useState(null);
     const [removeCover, setRemoveCover] = useState(false);  // Track if user wants to remove cover
     // Initialize hasCover from metadata if available for immediate display
     const [hasCover, setHasCover] = useState(() => {
         return !!(item.metadata?.cover);
     });
+    // Use stable cache key based on cover filename
+    const coverCacheKey = item.metadata?.cover || '';
     // Store existing cover URL to maintain it during edits
     const [existingCoverUrl, setExistingCoverUrl] = useState(() => {
         if (item.metadata?.cover) {
-            return `/api/generation/${item.id}/cover?t=${Date.now()}`;
+            return `/api/generation/${item.id}/cover?v=${encodeURIComponent(item.metadata.cover)}`;
         }
         return null;
     });
     const fileInputRef = useRef(null);
-
-    // Check if cover exists on mount (fallback for cases where metadata doesn't have cover flag)
-    useEffect(() => {
-        if (!hasCover && item.id) {
-            // Try to load the image directly - more reliable than HEAD request
-            const img = new Image();
-            img.onload = () => {
-                setHasCover(true);
-                setExistingCoverUrl(`/api/generation/${item.id}/cover?t=${Date.now()}`);
-            };
-            img.onerror = () => {}; // No cover exists, that's fine
-            img.src = `/api/generation/${item.id}/cover?t=${Date.now()}`;
-        }
-    }, [item.id, hasCover]);
+    // No need to probe server - trust metadata as source of truth
 
     const handleFileSelect = (e) => {
         const file = e.target.files[0];
@@ -1267,34 +1198,48 @@ var EditModal = ({ item, onClose, onSave }) => {
 
     const handleSave = async () => {
         setSaving(true);
+        setError(null);
         try {
             // Update title
-            await fetch(`/api/generation/${item.id}`, {
+            const titleRes = await fetch(`/api/generation/${item.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ title })
             });
+            if (!titleRes.ok) {
+                const errText = await titleRes.text();
+                throw new Error(`Failed to update title: ${errText}`);
+            }
 
             // Handle cover: remove, replace, or keep
             if (removeCover && !coverFile) {
                 // User wants to remove cover
-                await fetch(`/api/generation/${item.id}/cover`, {
+                const delRes = await fetch(`/api/generation/${item.id}/cover`, {
                     method: 'DELETE'
                 });
+                if (!delRes.ok && delRes.status !== 404) {
+                    const errText = await delRes.text();
+                    throw new Error(`Failed to remove cover: ${errText}`);
+                }
             } else if (coverFile) {
                 // Upload new cover
                 const formData = new FormData();
                 formData.append('file', coverFile);
-                await fetch(`/api/generation/${item.id}/cover`, {
+                const uploadRes = await fetch(`/api/generation/${item.id}/cover`, {
                     method: 'POST',
                     body: formData
                 });
+                if (!uploadRes.ok) {
+                    const errText = await uploadRes.text();
+                    throw new Error(`Failed to upload cover: ${errText}`);
+                }
             }
 
             onSave && onSave();
             onClose();
         } catch (e) {
             console.error('Save failed:', e);
+            setError(e.message || 'Save failed');
         } finally {
             setSaving(false);
         }
@@ -1432,6 +1377,21 @@ var EditModal = ({ item, onClose, onSave }) => {
                     </div>
                 </div>
 
+                {/* Error Message */}
+                {error && (
+                    <div style={{
+                        backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                        border: '1px solid rgba(239, 68, 68, 0.3)',
+                        borderRadius: '8px',
+                        padding: '10px 12px',
+                        marginBottom: '16px',
+                        color: '#f87171',
+                        fontSize: '13px',
+                    }}>
+                        {error}
+                    </div>
+                )}
+
                 {/* Buttons */}
                 <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
                     <button
@@ -1479,39 +1439,38 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
     const [exportError, setExportError] = useState(null);
     const meta = (isQueued || isGenerating) ? item : (item.metadata || {});
 
+    // Use a stable cache key based on cover filename (changes when cover is updated)
+    const coverCacheKey = meta.cover || '';
+
     // Initialize coverUrl from metadata if available (prevents flash on re-render)
     const [coverUrl, setCoverUrl] = useState(() => {
         if (!isQueued && !isGenerating && item.id && meta.cover) {
-            return `/api/generation/${item.id}/cover?t=${Date.now()}`;
+            return `/api/generation/${item.id}/cover?v=${encodeURIComponent(meta.cover)}`;
         }
         return null;
     });
-    // Track if we've already verified the cover
-    const coverCheckedRef = useRef(false);
+    // Track the last cover key we processed to detect changes
+    const lastCoverKeyRef = useRef(coverCacheKey);
 
-    // Check for cover image - also watch metadata.cover for updates
+    // Check for cover image - only update when cover actually changes
+    // Trust metadata as source of truth - don't probe server if no cover in metadata
     useEffect(() => {
         if (!isQueued && !isGenerating && item.id) {
-            // If metadata already indicates a cover exists, use it directly
+            const coverChanged = lastCoverKeyRef.current !== coverCacheKey;
+
             if (meta.cover) {
-                setCoverUrl(`/api/generation/${item.id}/cover?t=${Date.now()}`);
-                coverCheckedRef.current = true;
-            } else {
-                // Cover was removed or doesn't exist - clear the URL
-                setCoverUrl(null);
-                // Only do image check once per item if metadata doesn't have cover flag
-                if (!coverCheckedRef.current) {
-                    coverCheckedRef.current = true;
-                    const img = new Image();
-                    img.onload = () => {
-                        setCoverUrl(`/api/generation/${item.id}/cover?t=${Date.now()}`);
-                    };
-                    img.onerror = () => {}; // No cover, that's fine
-                    img.src = `/api/generation/${item.id}/cover?t=${Date.now()}`;
+                // Only set new URL if cover changed or we don't have one yet
+                if (coverChanged || !coverUrl) {
+                    setCoverUrl(`/api/generation/${item.id}/cover?v=${encodeURIComponent(meta.cover)}`);
+                    lastCoverKeyRef.current = coverCacheKey;
                 }
+            } else if (coverChanged) {
+                // Cover was removed - clear the URL
+                setCoverUrl(null);
+                lastCoverKeyRef.current = coverCacheKey;
             }
         }
-    }, [item.id, isQueued, isGenerating, meta.cover]);
+    }, [item.id, isQueued, isGenerating, coverCacheKey]);
 
     const formatDate = (dateStr) => {
         if (!dateStr) return 'Unknown';
@@ -1684,8 +1643,7 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                     item={item}
                     onClose={() => setEditing(false)}
                     onSave={() => {
-                        // Reset coverCheckedRef so useEffect will re-check after library reloads
-                        coverCheckedRef.current = false;
+                        // Trigger library reload to get updated metadata
                         onUpdate && onUpdate();
                     }}
                 />
@@ -1766,6 +1724,60 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                     )}
                 </div>
             )}
+        </div>
+    );
+};
+
+// Songs Panel Item - with hover-based play button overlay
+var SongsPanelItem = ({ item, audioPlayer, onDelete }) => {
+    const [isHovered, setIsHovered] = useState(false);
+    const meta = item.metadata || {};
+    const isPlaying = audioPlayer.playingId === item.id;
+    const isAudioPlaying = audioPlayer.isPlaying;
+    const canPlay = item.status === 'completed' && (item.output_file || item.output_files?.length > 0);
+    const coverUrl = meta.cover ? `/api/generation/${item.id}/cover?v=${encodeURIComponent(meta.cover)}` : null;
+
+    const showOverlay = canPlay && coverUrl && (isHovered || (isPlaying && isAudioPlaying));
+
+    return (
+        <div
+            className={`activity-item ${isPlaying ? 'active' : ''} ${item.status === 'failed' ? 'error' : ''}`}
+            style={{ cursor: canPlay ? 'pointer' : 'default', display: 'flex', gap: '10px', alignItems: 'center', position: 'relative' }}
+            onClick={() => canPlay && audioPlayer.play(item)}
+            onMouseEnter={() => setIsHovered(true)}
+            onMouseLeave={() => setIsHovered(false)}
+        >
+            {['completed', 'failed', 'stopped'].includes(item.status) && (
+                <button onClick={(e) => { e.stopPropagation(); onDelete(); }} style={{ position: 'absolute', top: '4px', right: '4px', background: 'none', border: 'none', color: '#555', cursor: 'pointer' }}>
+                    <TrashIcon size={10} />
+                </button>
+            )}
+            <div style={{
+                width: '44px', height: '44px', borderRadius: '6px',
+                backgroundColor: isPlaying ? '#10B981' : item.status === 'failed' ? '#EF4444' : '#2a2a2a',
+                backgroundImage: coverUrl ? `url(${coverUrl})` : 'none',
+                backgroundSize: 'cover', backgroundPosition: 'center',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative'
+            }}>
+                {canPlay && !coverUrl && (
+                    isPlaying && isAudioPlaying ? <PauseLargeIcon size={16} color="#fff" /> : <PlayLargeIcon size={16} color={isPlaying ? '#fff' : '#888'} />
+                )}
+                {showOverlay && (
+                    <div style={{
+                        position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        backgroundColor: 'rgba(0, 0, 0, 0.5)', borderRadius: '6px'
+                    }}>
+                        {isPlaying && isAudioPlaying ? <PauseLargeIcon size={16} color="#fff" /> : <PlayLargeIcon size={16} color="#fff" style={{ marginLeft: '2px' }} />}
+                    </div>
+                )}
+                {item.status === 'failed' && <CloseIcon color="#fff" />}
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="text-sm font-medium text-primary truncate">{meta.title || 'Untitled'}</div>
+                <div className="text-xs text-secondary truncate">{[meta.genre, meta.emotion].filter(Boolean).join(' • ') || 'No tags'}</div>
+                {(item.duration || meta.duration) && <div className="text-xs" style={{ color: '#555', marginTop: '2px' }}>{formatTime(item.duration || meta.duration)}</div>}
+            </div>
         </div>
     );
 };

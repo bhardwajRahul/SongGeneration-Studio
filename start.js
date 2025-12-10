@@ -11,7 +11,7 @@ module.exports = {
           PYTHONUTF8: "1"
         },
         path: "app",
-        message: "python api.py --host 127.0.0.1 --port {{port}}",
+        message: "python main.py --host 127.0.0.1 --port {{port}}",
         on: [{
           event: "/(http:\/\/[0-9.:]+)/",
           done: true

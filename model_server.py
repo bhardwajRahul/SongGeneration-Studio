@@ -1,406 +1,525 @@
 """
-Persistent Model Server for SongGeneration
-Keeps the model loaded in VRAM between generations to avoid 30s reload time.
-Uses FastAPI (already installed).
+SongGeneration Studio - Model Server Communication
+Persistent model in VRAM for fast generation.
 """
 
-import sys
 import os
-import json
+import sys
 import time
-import threading
-import traceback
-from pathlib import Path
+import asyncio
+import subprocess
+from typing import Optional
 
-print("[MODEL_SERVER] Script starting...", flush=True)
+import requests
 
-# Add parent directory to path for imports
-BASE_DIR = Path(__file__).parent
-sys.path.insert(0, str(BASE_DIR))
-sys.path.insert(0, str(BASE_DIR / "codeclm" / "tokenizer" / "Flow1dVAE"))
+from config import BASE_DIR, MODEL_SERVER_PORT, MODEL_SERVER_URL
 
-print(f"[MODEL_SERVER] BASE_DIR: {BASE_DIR}", flush=True)
-print(f"[MODEL_SERVER] Python: {sys.executable}", flush=True)
+# ============================================================================
+# Model Server Process
+# ============================================================================
 
-try:
-    import torch
-    print(f"[MODEL_SERVER] PyTorch loaded, CUDA available: {torch.cuda.is_available()}", flush=True)
-except Exception as e:
-    print(f"[MODEL_SERVER] Failed to import torch: {e}", flush=True)
-    sys.exit(1)
+model_server_process: Optional[subprocess.Popen] = None
 
-try:
-    import torchaudio
-    import numpy as np
-    from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel
-    from typing import Optional
-    import uvicorn
-    from omegaconf import OmegaConf
-    print("[MODEL_SERVER] All imports successful", flush=True)
-except Exception as e:
-    print(f"[MODEL_SERVER] Import error: {e}", flush=True)
-    traceback.print_exc()
-    sys.exit(1)
-
-app = FastAPI(title="SongGeneration Model Server")
-
-# Global state
-model_state = {
-    "loaded": False,
-    "loading": False,
-    "model_id": None,
-    "error": None,
-    "load_time": None,
-    "last_used": None,
-    "generations_count": 0,
-}
-
-# Model components (kept in memory)
-loaded_model = None
-loaded_separator = None
-loaded_audio_tokenizer = None
-loaded_seperate_tokenizer = None
-loaded_cfg = None
-loaded_auto_prompt = None
-model_lock = threading.Lock()
-
-auto_prompt_type = ['Pop', 'R&B', 'Dance', 'Jazz', 'Folk', 'Rock', 'Chinese Style', 'Chinese Tradition', 'Metal', 'Reggae', 'Chinese Opera', 'Auto']
+# Cache for model server status to reduce HTTP calls
+_status_cache = {"data": None, "timestamp": 0}
+_STATUS_CACHE_TTL = 2.0  # Cache status for 2 seconds
 
 
-class LoadRequest(BaseModel):
-    model_id: str = "songgeneration_base"
-    use_flash_attn: bool = False
-    low_mem: bool = True
+def invalidate_status_cache():
+    """Invalidate the status cache to force a fresh fetch."""
+    global _status_cache
+    _status_cache = {"data": None, "timestamp": 0}
 
-
-class GenerateRequest(BaseModel):
-    input_jsonl: str
-    save_dir: str
-    gen_type: str = "mixed"
-
-
-def load_model_impl(model_id: str, use_flash_attn: bool = False, low_mem: bool = True):
-    """Load model into VRAM. Called once and kept resident."""
-    global loaded_model, loaded_separator, loaded_audio_tokenizer
-    global loaded_seperate_tokenizer, loaded_cfg, loaded_auto_prompt, model_state
-
-    # Import heavy modules only when needed
-    from codeclm.models import builders
-    from codeclm.models import CodecLM
-    from third_party.demucs.models.pretrained import get_model_from_yaml
-
-    class Separator:
-        """Audio separator using Demucs"""
-        def __init__(self, dm_model_path='third_party/demucs/ckpt/htdemucs.pth',
-                     dm_config_path='third_party/demucs/ckpt/htdemucs.yaml', gpu_id=0):
-            if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
-                self.device = torch.device(f"cuda:{gpu_id}")
-            else:
-                self.device = torch.device("cpu")
-            model = get_model_from_yaml(dm_config_path, dm_model_path)
-            model.to(self.device)
-            model.eval()
-            self.demucs_model = model
-
-        def load_audio(self, f):
-            a, fs = torchaudio.load(f)
-            if fs != 48000:
-                a = torchaudio.functional.resample(a, fs, 48000)
-            if a.shape[-1] >= 48000 * 10:
-                a = a[..., :48000 * 10]
-            return a[:, 0:48000 * 10]
-
-        def run(self, audio_path, output_dir='tmp', ext=".flac"):
-            os.makedirs(output_dir, exist_ok=True)
-            name, _ = os.path.splitext(os.path.split(audio_path)[-1])
-            output_paths = []
-            for stem in self.demucs_model.sources:
-                output_path = os.path.join(output_dir, f"{name}_{stem}{ext}")
-                if os.path.exists(output_path):
-                    output_paths.append(output_path)
-            if len(output_paths) == 1:
-                vocal_path = output_paths[0]
-            else:
-                drums_path, bass_path, other_path, vocal_path = self.demucs_model.separate(
-                    audio_path, output_dir, device=self.device)
-                for path in [drums_path, bass_path, other_path]:
-                    os.remove(path)
-            full_audio = self.load_audio(audio_path)
-            vocal_audio = self.load_audio(vocal_path)
-            bgm_audio = full_audio - vocal_audio
-            return full_audio, vocal_audio, bgm_audio
-
-    with model_lock:
-        if model_state["loading"]:
-            return {"error": "Model is already loading"}
-        model_state["loading"] = True
-        model_state["error"] = None
-
+def is_model_server_running() -> bool:
+    """Check if model server is running and responsive (blocking)."""
     try:
-        print(f"[MODEL_SERVER] Loading model: {model_id}", flush=True)
-        start_time = time.time()
+        resp = requests.get(f"{MODEL_SERVER_URL}/health", timeout=2)
+        return resp.status_code == 200
+    except:
+        return False
 
-        ckpt_dir = BASE_DIR / model_id
-        cfg_path = ckpt_dir / 'config.yaml'
-        ckpt_path = ckpt_dir / 'model.pt'
 
-        if not cfg_path.exists() or not ckpt_path.exists():
-            raise FileNotFoundError(f"Model files not found at {ckpt_dir}")
+async def is_model_server_running_async() -> bool:
+    """Check if model server is running (non-blocking)."""
+    return await asyncio.to_thread(is_model_server_running)
 
-        # Register OmegaConf resolvers (required for config interpolations)
-        try:
-            OmegaConf.register_new_resolver("eval", lambda x: eval(x))
-            OmegaConf.register_new_resolver("concat", lambda *x: [xxx for xx in x for xxx in xx])
-            OmegaConf.register_new_resolver("get_fname", lambda: 'default')
-            OmegaConf.register_new_resolver("load_yaml", lambda x: list(OmegaConf.load(x)))
-        except ValueError:
-            pass  # Resolvers already registered
 
-        # Load config
-        cfg = OmegaConf.load(str(cfg_path))
-        cfg.lm.use_flash_attn_2 = use_flash_attn
-        cfg.mode = 'inference'
-        loaded_cfg = cfg
-
-        max_duration = cfg.max_dur
-
-        print(f"[MODEL_SERVER] Loading audio tokenizer...", flush=True)
-        loaded_audio_tokenizer = builders.get_audio_tokenizer_model(cfg.audio_tokenizer_checkpoint, cfg)
-        loaded_audio_tokenizer = loaded_audio_tokenizer.eval().cuda()
-
-        print(f"[MODEL_SERVER] Loading auto prompt...", flush=True)
-        loaded_auto_prompt = torch.load(str(BASE_DIR / 'tools/new_prompt.pt'))
-
-        # Load separate tokenizer if available
-        if "audio_tokenizer_checkpoint_sep" in cfg.keys():
-            print(f"[MODEL_SERVER] Loading separate tokenizer...", flush=True)
-            loaded_seperate_tokenizer = builders.get_audio_tokenizer_model(cfg.audio_tokenizer_checkpoint_sep, cfg)
-            loaded_seperate_tokenizer = loaded_seperate_tokenizer.eval().cuda()
+def kill_process_on_port(port: int) -> bool:
+    """Kill any process using the specified port."""
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.split('\n'):
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        pid = parts[-1]
+                        print(f"[MODEL_SERVER] Killing process {pid} on port {port}", flush=True)
+                        subprocess.run(["taskkill", "/F", "/PID", pid],
+                                      capture_output=True, timeout=10)
+                        time.sleep(2)
+                        return True
         else:
-            loaded_seperate_tokenizer = None
-
-        print(f"[MODEL_SERVER] Loading LM model (this takes ~30s)...", flush=True)
-        audiolm = builders.get_lm_model(cfg)
-        checkpoint = torch.load(str(ckpt_path), map_location='cpu')
-        audiolm_state_dict = {k.replace('audiolm.', ''): v for k, v in checkpoint.items() if k.startswith('audiolm')}
-        audiolm.load_state_dict(audiolm_state_dict, strict=False)
-        audiolm = audiolm.eval()
-        audiolm = audiolm.cuda().to(torch.float16)
-
-        print(f"[MODEL_SERVER] Creating CodecLM wrapper...", flush=True)
-        loaded_model = CodecLM(
-            name="persistent_model",
-            lm=audiolm,
-            audiotokenizer=None,
-            max_duration=max_duration,
-            seperate_tokenizer=loaded_seperate_tokenizer,
-        )
-        loaded_model.max_duration = max_duration
-
-        load_time = time.time() - start_time
-
-        with model_lock:
-            model_state["loaded"] = True
-            model_state["loading"] = False
-            model_state["model_id"] = model_id
-            model_state["load_time"] = load_time
-            model_state["last_used"] = time.time()
-
-        print(f"[MODEL_SERVER] Model loaded in {load_time:.1f}s", flush=True)
-        return {"status": "loaded", "model_id": model_id, "load_time": load_time}
-
+            try:
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{port}"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.stdout.strip():
+                    pid = result.stdout.strip().split('\n')[0]
+                    print(f"[MODEL_SERVER] Killing process {pid} on port {port}", flush=True)
+                    subprocess.run(["kill", "-9", pid], capture_output=True, timeout=10)
+                    time.sleep(2)
+                    return True
+            except FileNotFoundError:
+                subprocess.run(["fuser", "-k", f"{port}/tcp"],
+                              capture_output=True, timeout=10)
+                time.sleep(2)
+                return True
     except Exception as e:
-        traceback.print_exc()
-        with model_lock:
-            model_state["loading"] = False
-            model_state["error"] = str(e)
-        return {"error": str(e)}
+        print(f"[MODEL_SERVER] Failed to kill process on port {port}: {e}", flush=True)
+    return False
 
 
-def generate_impl(input_jsonl: str, save_dir: str, gen_type: str = 'mixed'):
-    """Generate a song using the loaded model."""
-    global loaded_model, loaded_audio_tokenizer, loaded_seperate_tokenizer
-    global loaded_cfg, loaded_auto_prompt, model_state
+def get_model_server_status() -> dict:
+    """Get model server status including loaded model info (blocking).
 
-    if not model_state["loaded"]:
-        return {"error": "Model not loaded"}
+    Uses a short-lived cache to prevent excessive HTTP calls.
+    """
+    global model_server_process, _status_cache
 
-    try:
-        print(f"[MODEL_SERVER] Starting generation...", flush=True)
-        start_time = time.time()
+    # Check cache first
+    now = time.time()
+    if _status_cache["data"] is not None and (now - _status_cache["timestamp"]) < _STATUS_CACHE_TTL:
+        return _status_cache["data"]
 
-        cfg = loaded_cfg
-        max_duration = loaded_model.max_duration
+    # Fast path: if server process isn't running, return immediately
+    if model_server_process is None or model_server_process.poll() is not None:
+        # Server process not running - do a quick check just in case it was started externally
+        try:
+            resp = requests.get(f"{MODEL_SERVER_URL}/status", timeout=1)
+            if resp.status_code == 200:
+                data = resp.json()
+                data["running"] = True
+                _status_cache = {"data": data, "timestamp": now}
+                return data
+        except:
+            pass
+        result = {"loaded": False, "running": False, "error": "not_running"}
+        _status_cache = {"data": result, "timestamp": now}
+        return result
 
-        with open(input_jsonl, "r") as fp:
-            lines = fp.readlines()
+    # Server process should be running - do proper status check
+    max_retries = 2
+    timeout_seconds = 3
 
-        new_items = []
-        for line in lines:
-            item = json.loads(line)
-            target_wav_name = f"{save_dir}/audios/{item['idx']}.flac"
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(f"{MODEL_SERVER_URL}/status", timeout=timeout_seconds)
+            if resp.status_code == 200:
+                data = resp.json()
+                data["running"] = True
+                _status_cache = {"data": data, "timestamp": now}
+                return data
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(0.3)
+            continue
+        except requests.exceptions.ConnectionError:
+            result = {"loaded": False, "running": False, "error": "not_running"}
+            _status_cache = {"data": result, "timestamp": now}
+            return result
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(0.3)
+            continue
 
-            # Handle auto_prompt_audio_type
-            if "auto_prompt_audio_type" in item:
-                prompt_token = loaded_auto_prompt[item["auto_prompt_audio_type"]][
-                    np.random.randint(0, len(loaded_auto_prompt[item["auto_prompt_audio_type"]]))]
-                pmt_wav = prompt_token[:, [0], :]
-                vocal_wav = prompt_token[:, [1], :]
-                bgm_wav = prompt_token[:, [2], :]
-                melody_is_wav = False
-            else:
-                pmt_wav = None
-                vocal_wav = None
-                bgm_wav = None
-                melody_is_wav = True
-
-            item['pmt_wav'] = pmt_wav
-            item['vocal_wav'] = vocal_wav
-            item['bgm_wav'] = bgm_wav
-            item['melody_is_wav'] = melody_is_wav
-            item["idx"] = f"{item['idx']}"
-            item["wav_path"] = target_wav_name
-            new_items.append(item)
-
-        # Set generation params
-        loaded_model.set_generation_params(
-            duration=max_duration,
-            extend_stride=5,
-            temperature=0.9,
-            cfg_coef=1.5,
-            top_k=50,
-            top_p=0.0,
-            record_tokens=True,
-            record_window=50
-        )
-
-        os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(save_dir + "/audios", exist_ok=True)
-        os.makedirs(save_dir + "/jsonl", exist_ok=True)
-
-        for item in new_items:
-            lyric = item["gt_lyric"]
-            descriptions = item.get("descriptions")
-            target_wav_name = item["wav_path"]
-
-            generate_inp = {
-                'lyrics': [lyric.replace("  ", " ")],
-                'descriptions': [descriptions],
-                'melody_wavs': item['pmt_wav'],
-                'vocal_wavs': item['vocal_wav'],
-                'bgm_wavs': item['bgm_wav'],
-                'melody_is_wav': item['melody_is_wav'],
-            }
-
-            gen_start = time.time()
-            print(f"[MODEL_SERVER] Generating tokens...", flush=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                with torch.no_grad():
-                    tokens = loaded_model.generate(**generate_inp, return_tokens=True)
-            mid_time = time.time()
-
-            print(f"[MODEL_SERVER] Generating audio...", flush=True)
-            with torch.no_grad():
-                wav_seperate = loaded_model.generate_audio(tokens, chunked=True, gen_type=gen_type)
-
-            end_time = time.time()
-            torchaudio.save(target_wav_name, wav_seperate[0].cpu().float(), cfg.sample_rate)
-
-            print(f"[MODEL_SERVER] process{item['idx']}, lm cost {mid_time - gen_start:.1f}s, "
-                  f"diffusion cost {end_time - mid_time:.1f}s", flush=True)
-
-        # Save output jsonl
-        src_jsonl_name = os.path.split(input_jsonl)[-1]
-        with open(f"{save_dir}/jsonl/{src_jsonl_name}.jsonl", "w", encoding='utf-8') as fw:
-            for item in new_items:
-                clean_item = {k: v for k, v in item.items() if k not in ['pmt_wav', 'vocal_wav', 'bgm_wav', 'melody_is_wav']}
-                fw.writelines(json.dumps(clean_item, ensure_ascii=False) + "\n")
-
-        total_time = time.time() - start_time
-
-        with model_lock:
-            model_state["last_used"] = time.time()
-            model_state["generations_count"] += 1
-
-        print(f"[MODEL_SERVER] Generation complete in {total_time:.1f}s", flush=True)
-        return {
-            "status": "completed",
-            "output_files": [item["wav_path"] for item in new_items],
-            "generation_time": total_time
-        }
-
-    except Exception as e:
-        traceback.print_exc()
-        return {"error": str(e)}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.get("/status")
-async def status():
-    gpu_mem = None
-    if torch.cuda.is_available():
-        gpu_mem = {
-            "allocated_gb": round(torch.cuda.memory_allocated() / 1024**3, 2),
-            "reserved_gb": round(torch.cuda.memory_reserved() / 1024**3, 2),
-        }
-    return {**model_state, "gpu_memory": gpu_mem}
-
-
-@app.post("/load")
-async def load(req: LoadRequest):
-    def do_load():
-        load_model_impl(req.model_id, req.use_flash_attn, req.low_mem)
-    thread = threading.Thread(target=do_load)
-    thread.start()
-    return {"status": "loading", "model_id": req.model_id}
-
-
-@app.post("/unload")
-async def unload():
-    global loaded_model, loaded_separator, loaded_audio_tokenizer
-    global loaded_seperate_tokenizer, loaded_cfg, loaded_auto_prompt, model_state
-
-    with model_lock:
-        loaded_model = None
-        loaded_separator = None
-        loaded_audio_tokenizer = None
-        loaded_seperate_tokenizer = None
-        loaded_cfg = None
-        loaded_auto_prompt = None
-        torch.cuda.empty_cache()
-        model_state["loaded"] = False
-        model_state["model_id"] = None
-
-    return {"status": "unloaded"}
-
-
-@app.post("/generate")
-async def generate(req: GenerateRequest):
-    if not model_state["loaded"]:
-        raise HTTPException(400, "Model not loaded")
-    result = generate_impl(req.input_jsonl, req.save_dir, req.gen_type)
-    if "error" in result:
-        raise HTTPException(500, result["error"])
+    result = {"loaded": False, "running": False, "error": "timeout"}
+    _status_cache = {"data": result, "timestamp": now}
     return result
 
 
-if __name__ == '__main__':
+async def get_model_server_status_async() -> dict:
+    """Get model server status (non-blocking)."""
+    return await asyncio.to_thread(get_model_server_status)
+
+
+async def start_model_server(preload_model: str = None) -> bool:
+    """Start the model server process (async)."""
+    global model_server_process
+
+    if await is_model_server_running_async():
+        print("[MODEL_SERVER] Already running", flush=True)
+        return True
+
+    await asyncio.to_thread(kill_process_on_port, MODEL_SERVER_PORT)
+
+    print("[MODEL_SERVER] Starting model server...", flush=True)
+
+    if sys.platform == "win32":
+        python_exe = BASE_DIR / "env" / "Scripts" / "python.exe"
+    else:
+        python_exe = BASE_DIR / "env" / "bin" / "python"
+
+    if not python_exe.exists():
+        python_exe = sys.executable
+
+    print(f"[MODEL_SERVER] Using Python: {python_exe}", flush=True)
+
+    cmd = [str(python_exe), str(BASE_DIR / "model_server.py"),
+           "--port", str(MODEL_SERVER_PORT), "--host", "127.0.0.1"]
+
+    if preload_model:
+        cmd.extend(["--preload", preload_model])
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    flow_vae_dir = BASE_DIR / "codeclm" / "tokenizer" / "Flow1dVAE"
+    pathsep = os.pathsep
+    env["PYTHONPATH"] = f"{BASE_DIR}{pathsep}{flow_vae_dir}{pathsep}{env.get('PYTHONPATH', '')}"
+
+    print(f"[MODEL_SERVER] Command: {' '.join(cmd)}", flush=True)
+
+    try:
+        model_server_process = subprocess.Popen(
+            cmd,
+            cwd=str(BASE_DIR),
+            env=env,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+
+        for i in range(60):
+            await asyncio.sleep(1)
+
+            if model_server_process.poll() is not None:
+                print(f"[MODEL_SERVER] Process exited with code {model_server_process.returncode}", flush=True)
+                return False
+
+            if await is_model_server_running_async():
+                print(f"[MODEL_SERVER] Server started successfully after {i+1}s", flush=True)
+                return True
+
+            if i % 10 == 9:
+                print(f"[MODEL_SERVER] Still waiting... ({i+1}s)", flush=True)
+
+        print("[MODEL_SERVER] Server failed to start in time (60s timeout)", flush=True)
+        try:
+            model_server_process.terminate()
+        except:
+            pass
+        return False
+
+    except Exception as e:
+        print(f"[MODEL_SERVER] Failed to start: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def stop_model_server():
+    """Stop the model server process."""
+    global model_server_process
+
+    if model_server_process:
+        model_server_process.terminate()
+        try:
+            model_server_process.wait(timeout=5)
+        except:
+            model_server_process.kill()
+        model_server_process = None
+        invalidate_status_cache()  # Server stopped
+        print("[MODEL_SERVER] Server stopped")
+
+
+def load_model_on_server(model_id: str) -> dict:
+    """Request model server to load a model (blocking)."""
+    try:
+        resp = requests.post(f"{MODEL_SERVER_URL}/load",
+                           json={"model_id": model_id}, timeout=5)
+        invalidate_status_cache()  # State changed
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def load_model_on_server_async(model_id: str) -> dict:
+    """Request model server to load a model (non-blocking)."""
+    return await asyncio.to_thread(load_model_on_server, model_id)
+
+
+def generate_via_server(input_jsonl: str, save_dir: str, gen_type: str = "mixed") -> dict:
+    """Send generation request to model server (blocking)."""
+    try:
+        invalidate_status_cache()  # Generating state will change
+        resp = requests.post(f"{MODEL_SERVER_URL}/generate",
+                           json={
+                               "input_jsonl": input_jsonl,
+                               "save_dir": save_dir,
+                               "gen_type": gen_type
+                           }, timeout=1800)
+        invalidate_status_cache()  # Generation completed
+        return resp.json()
+    except Exception as e:
+        invalidate_status_cache()
+        return {"error": str(e)}
+
+
+async def generate_via_server_async(input_jsonl: str, save_dir: str, gen_type: str = "mixed") -> dict:
+    """Send generation request to model server (non-blocking)."""
+    return await asyncio.to_thread(generate_via_server, input_jsonl, save_dir, gen_type)
+
+
+def cancel_generation_on_server() -> dict:
+    """Request cancellation of current generation."""
+    try:
+        resp = requests.post(f"{MODEL_SERVER_URL}/cancel", timeout=5)
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def cancel_generation_on_server_async() -> dict:
+    """Request cancellation of current generation (async)."""
+    return await asyncio.to_thread(cancel_generation_on_server)
+
+
+def unload_model_on_server() -> dict:
+    """Unload model from VRAM."""
+    try:
+        resp = requests.post(f"{MODEL_SERVER_URL}/unload", timeout=10)
+        invalidate_status_cache()  # State changed
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================================
+# Actual Model Server (when run as script)
+# ============================================================================
+
+if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=42100)
-    parser.add_argument('--host', type=str, default='127.0.0.1')
-    parser.add_argument('--preload', type=str, help='Model to preload on startup')
+    import gc
+    import json
+    import traceback
+    from pathlib import Path
+    from datetime import datetime
+
+    import torch
+    import uvicorn
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    import soundfile as sf
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="SongGeneration Model Server")
+    parser.add_argument("--port", type=int, default=42100, help="Port to run server on")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind to")
+    parser.add_argument("--preload", type=str, default=None, help="Model to preload")
     args = parser.parse_args()
 
-    print(f"[MODEL_SERVER] Starting on {args.host}:{args.port}", flush=True)
+    # Add paths for imports
+    APP_DIR = Path(__file__).parent
+    sys.path.insert(0, str(APP_DIR))
+    sys.path.insert(0, str(APP_DIR / "tools" / "gradio"))
+    sys.path.insert(0, str(APP_DIR / "codeclm" / "tokenizer" / "Flow1dVAE"))
 
+    from levo_inference_lowmem import LeVoInference
+
+    # Create FastAPI app
+    server_app = FastAPI(title="SongGeneration Model Server")
+
+    # Model state
+    class ModelState:
+        def __init__(self):
+            self.model: Optional[LeVoInference] = None
+            self.model_id: Optional[str] = None
+            self.loading: bool = False
+            self.error: Optional[str] = None
+            self.cancel_requested: bool = False
+            self.generating: bool = False
+
+    state = ModelState()
+
+    # Request models
+    class LoadRequest(BaseModel):
+        model_id: str
+
+    class GenerateRequest(BaseModel):
+        input_jsonl: str
+        save_dir: str
+        gen_type: str = "mixed"
+
+    @server_app.get("/health")
+    def health():
+        """Health check endpoint."""
+        return {"status": "ok"}
+
+    @server_app.get("/status")
+    def status():
+        """Get current model server status."""
+        return {
+            "loaded": state.model is not None,
+            "model_id": state.model_id,
+            "loading": state.loading,
+            "error": state.error,
+            "generating": state.generating,
+            "cancel_requested": state.cancel_requested
+        }
+
+    @server_app.post("/cancel")
+    def cancel():
+        """Request cancellation of current generation."""
+        if state.generating:
+            state.cancel_requested = True
+            print("[MODEL_SERVER] Cancel requested", flush=True)
+            return {"status": "cancel_requested"}
+        return {"status": "not_generating"}
+
+    @server_app.post("/load")
+    def load_model(req: LoadRequest):
+        """Load a model into VRAM."""
+        if state.loading:
+            return {"error": "Already loading a model"}
+
+        if state.model is not None and state.model_id == req.model_id:
+            return {"status": "already_loaded", "model_id": req.model_id}
+
+        try:
+            state.loading = True
+            state.error = None
+
+            # Unload existing model first
+            if state.model is not None:
+                del state.model
+                state.model = None
+                state.model_id = None
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            model_path = APP_DIR / req.model_id
+            if not model_path.exists():
+                state.error = f"Model not found: {req.model_id}"
+                state.loading = False
+                return {"error": state.error}
+
+            print(f"[MODEL_SERVER] Loading model: {req.model_id}", flush=True)
+            state.model = LeVoInference(str(model_path))
+            state.model_id = req.model_id
+            state.loading = False
+            print(f"[MODEL_SERVER] Model loaded: {req.model_id}", flush=True)
+
+            return {"status": "loaded", "model_id": req.model_id}
+
+        except Exception as e:
+            state.error = str(e)
+            state.loading = False
+            print(f"[MODEL_SERVER] Failed to load model: {e}", flush=True)
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    @server_app.post("/generate")
+    def generate(req: GenerateRequest):
+        """Generate audio from input."""
+        if state.model is None:
+            return {"error": "No model loaded"}
+
+        # Reset cancel flag and set generating
+        state.cancel_requested = False
+        state.generating = True
+
+        try:
+            print(f"[MODEL_SERVER] Starting generation...", flush=True)
+
+            # Read input JSONL
+            with open(req.input_jsonl, 'r', encoding='utf-8') as f:
+                input_data = json.loads(f.readline())
+
+            lyric = input_data.get("gt_lyric", "")
+            description = input_data.get("descriptions", None)
+            prompt_audio = input_data.get("prompt_audio_path", None)
+            auto_prompt_type = input_data.get("auto_prompt_audio_type", None)
+
+            # Get auto prompt path
+            auto_prompt_path = None
+            if auto_prompt_type and auto_prompt_type != "Auto":
+                auto_prompt_path = str(APP_DIR / "tools" / "new_prompt.pt")
+
+            print(f"[MODEL_SERVER] Lyric: {lyric[:100]}...", flush=True)
+            print(f"[MODEL_SERVER] Description: {description}", flush=True)
+            print(f"[MODEL_SERVER] Gen type: {req.gen_type}", flush=True)
+
+            # Run inference
+            start_time = time.time()
+            audio_data = state.model(
+                lyric=lyric,
+                description=description,
+                prompt_audio_path=prompt_audio,
+                genre=auto_prompt_type,
+                auto_prompt_path=auto_prompt_path,
+                gen_type=req.gen_type
+            )
+            gen_time = time.time() - start_time
+
+            # Check if cancelled during generation
+            if state.cancel_requested:
+                print(f"[MODEL_SERVER] Generation cancelled after {gen_time:.1f}s", flush=True)
+                state.generating = False
+                state.cancel_requested = False
+                return {"status": "cancelled", "message": "Generation was cancelled"}
+
+            print(f"[MODEL_SERVER] Generation completed in {gen_time:.1f}s", flush=True)
+
+            # Save audio
+            save_dir = Path(req.save_dir)
+            audios_dir = save_dir / "audios"
+            audios_dir.mkdir(parents=True, exist_ok=True)
+
+            # Convert to numpy and save
+            audio_np = audio_data.cpu().permute(1, 0).float().numpy()
+            sample_rate = state.model.cfg.sample_rate
+
+            output_file = audios_dir / f"{input_data.get('idx', 'output')}.flac"
+            sf.write(str(output_file), audio_np, sample_rate)
+
+            print(f"[MODEL_SERVER] Saved to: {output_file}", flush=True)
+            state.generating = False
+
+            return {
+                "status": "completed",
+                "output_file": str(output_file),
+                "generation_time": gen_time
+            }
+
+        except Exception as e:
+            print(f"[MODEL_SERVER] Generation failed: {e}", flush=True)
+            traceback.print_exc()
+            state.generating = False
+            return {"error": str(e)}
+
+    @server_app.post("/unload")
+    def unload():
+        """Unload model from VRAM."""
+        try:
+            if state.model is not None:
+                del state.model
+                state.model = None
+                state.model_id = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                print("[MODEL_SERVER] Model unloaded", flush=True)
+            return {"status": "unloaded"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # Preload model if specified
     if args.preload:
         print(f"[MODEL_SERVER] Preloading model: {args.preload}", flush=True)
-        load_model_impl(args.preload)
+        load_model(LoadRequest(model_id=args.preload))
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # Run server
+    print(f"[MODEL_SERVER] Starting server on {args.host}:{args.port}", flush=True)
+    uvicorn.run(server_app, host=args.host, port=args.port, log_level="info")
