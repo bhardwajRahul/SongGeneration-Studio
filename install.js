@@ -41,7 +41,8 @@ module.exports = {
         message: [
           "uv pip install -r requirements.txt",
           "uv pip install -r requirements_nodeps.txt --no-deps",
-          "uv pip install fastapi uvicorn python-multipart aiofiles"
+          "uv pip install fastapi uvicorn python-multipart aiofiles",
+          "uv pip install transformers==4.37.2 --force-reinstall --no-deps"
         ]
       }
     },
@@ -66,8 +67,7 @@ module.exports = {
     { method: "fs.copy", params: { src: "web/static/icons.js", dest: "app/web/static/icons.js" } },
     { method: "fs.copy", params: { src: "web/static/Logo_1.png", dest: "app/web/static/Logo_1.png" } },
     { method: "fs.copy", params: { src: "web/static/default.jpg", dest: "app/web/static/default.jpg" } },
-    // 7. Apply flash attention fixes for Windows compatibility
-    { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } },
-    { method: "fs.copy", params: { src: "patches/llama/modeling_llama.py", dest: "app/codeclm/models/llama/modeling_llama.py" } }
+    // 7. Apply flash attention fix for Windows compatibility (disables flash attn if not available)
+    { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } }
   ]
 }

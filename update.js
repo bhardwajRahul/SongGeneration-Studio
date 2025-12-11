@@ -36,8 +36,7 @@ module.exports = {
     { method: "fs.copy", params: { src: "web/static/icons.js", dest: "app/web/static/icons.js" } },
     { method: "fs.copy", params: { src: "web/static/Logo_1.png", dest: "app/web/static/Logo_1.png" } },
     { method: "fs.copy", params: { src: "web/static/default.jpg", dest: "app/web/static/default.jpg" } },
-    // 4. Re-apply flash attention fixes for Windows compatibility
-    { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } },
-    { method: "fs.copy", params: { src: "patches/llama/modeling_llama.py", dest: "app/codeclm/models/llama/modeling_llama.py" } }
+    // 4. Re-apply flash attention fix for Windows compatibility
+    { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } }
   ]
 }
