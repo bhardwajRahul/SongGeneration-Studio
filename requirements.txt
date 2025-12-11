@@ -1,22 +1,14 @@
 # SongGeneration Studio - Pinned Requirements
-# These versions are tested and working together on Windows with CUDA
-# DO NOT use Tencent's requirements.txt - it has incompatible newer versions
-
-# === CRITICAL: PyTorch ecosystem ===
-# NOTE: torch, torchaudio, torchvision are installed by torch.js with CUDA support
-# DO NOT add them here or they'll be reinstalled without CUDA
+# These versions are TESTED and WORKING together
+# NOTE: Tencent's GitHub requirements.txt has newer versions that are INCOMPATIBLE with their code!
 
 # === CRITICAL: Transformers ecosystem (must match!) ===
 transformers==4.37.2
 tokenizers==0.15.2
 peft==0.10.0
 accelerate>=1.0.0
-
-# === CRITICAL: Other pinned versions ===
 diffusers==0.27.2
 huggingface-hub==0.25.2
-hydra-core==1.0.7
-omegaconf==2.2.0
 
 # === Audio processing ===
 alias-free-torch>=0.0.6

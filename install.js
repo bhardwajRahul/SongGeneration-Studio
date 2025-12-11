@@ -22,21 +22,21 @@ module.exports = {
       }
     },
     // 3. Override Tencent's requirements with our tested working versions
-    // (Tencent's repo has newer incompatible versions that break the code)
+    // (Tencent's GitHub has newer INCOMPATIBLE versions!)
     { method: "fs.copy", params: { src: "requirements.txt", dest: "app/requirements.txt" } },
     { method: "fs.copy", params: { src: "requirements_nodeps.txt", dest: "app/requirements_nodeps.txt" } },
-    // 4. Install PyTorch with CUDA support
+    // 4. Create virtual environment and install PyTorch 2.6.0 with CUDA 12.4
     {
-      method: "script.start",
+      method: "shell.run",
       params: {
-        uri: "torch.js",
-        params: {
-          venv: "env",
-          path: "app"
-        }
+        venv: "env",
+        path: "app",
+        message: [
+          "uv pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124"
+        ]
       }
     },
-    // 5. Install Python dependencies (using our pinned requirements)
+    // 5. Install Python dependencies
     {
       method: "shell.run",
       params: {
