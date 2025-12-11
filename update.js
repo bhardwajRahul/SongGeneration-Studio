@@ -15,7 +15,10 @@ module.exports = {
         message: "git pull"
       }
     },
-    // 3. Re-sync custom files from root to app/
+    // 3. Re-sync requirements (override Tencent's broken versions)
+    { method: "fs.copy", params: { src: "requirements.txt", dest: "app/requirements.txt" } },
+    { method: "fs.copy", params: { src: "requirements_nodeps.txt", dest: "app/requirements_nodeps.txt" } },
+    // 4. Re-sync custom files from root to app/
     // This re-applies our customizations after pulling upstream changes
     { method: "fs.copy", params: { src: "main.py", dest: "app/main.py" } },
     { method: "fs.copy", params: { src: "generation.py", dest: "app/generation.py" } },
@@ -36,7 +39,7 @@ module.exports = {
     { method: "fs.copy", params: { src: "web/static/icons.js", dest: "app/web/static/icons.js" } },
     { method: "fs.copy", params: { src: "web/static/Logo_1.png", dest: "app/web/static/Logo_1.png" } },
     { method: "fs.copy", params: { src: "web/static/default.jpg", dest: "app/web/static/default.jpg" } },
-    // 4. Re-apply flash attention fix for Windows compatibility
+    // 5. Re-apply flash attention fix for Windows compatibility
     { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } }
   ]
 }

@@ -3,7 +3,7 @@ module.exports = {
     bundle: "ai"
   },
   run: [
-    // 1. Clone the SongGeneration repo (contains codeclm/, requirements.txt, web/, etc.)
+    // 1. Clone the SongGeneration repo (contains codeclm/, web/, etc.)
     {
       method: "shell.run",
       params: {
@@ -21,7 +21,11 @@ module.exports = {
         "local-dir": "."
       }
     },
-    // 3. Install PyTorch
+    // 3. Override Tencent's requirements with our tested working versions
+    // (Tencent's repo has newer incompatible versions that break the code)
+    { method: "fs.copy", params: { src: "requirements.txt", dest: "app/requirements.txt" } },
+    { method: "fs.copy", params: { src: "requirements_nodeps.txt", dest: "app/requirements_nodeps.txt" } },
+    // 4. Install PyTorch with CUDA support
     {
       method: "script.start",
       params: {
@@ -32,7 +36,7 @@ module.exports = {
         }
       }
     },
-    // 4. Install Python dependencies
+    // 5. Install Python dependencies (using our pinned requirements)
     {
       method: "shell.run",
       params: {
@@ -41,13 +45,11 @@ module.exports = {
         message: [
           "uv pip install -r requirements.txt",
           "uv pip install -r requirements_nodeps.txt --no-deps",
-          "uv pip install fastapi uvicorn python-multipart aiofiles",
-          "uv pip install transformers==4.37.2 tokenizers==0.15.2 peft==0.10.0 --force-reinstall",
-          "uv pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall"
+          "uv pip install fastapi uvicorn python-multipart aiofiles"
         ]
       }
     },
-    // 5. Sync custom Python files from root to app/
+    // 6. Sync custom Python files from root to app/
     { method: "fs.copy", params: { src: "main.py", dest: "app/main.py" } },
     { method: "fs.copy", params: { src: "generation.py", dest: "app/generation.py" } },
     { method: "fs.copy", params: { src: "model_server.py", dest: "app/model_server.py" } },
@@ -57,7 +59,7 @@ module.exports = {
     { method: "fs.copy", params: { src: "schemas.py", dest: "app/schemas.py" } },
     { method: "fs.copy", params: { src: "sse.py", dest: "app/sse.py" } },
     { method: "fs.copy", params: { src: "timing.py", dest: "app/timing.py" } },
-    // 6. Sync custom web files from root to app/
+    // 7. Sync custom web files from root to app/
     { method: "fs.copy", params: { src: "web/static/index.html", dest: "app/web/static/index.html" } },
     { method: "fs.copy", params: { src: "web/static/styles.css", dest: "app/web/static/styles.css" } },
     { method: "fs.copy", params: { src: "web/static/app.js", dest: "app/web/static/app.js" } },
@@ -68,7 +70,7 @@ module.exports = {
     { method: "fs.copy", params: { src: "web/static/icons.js", dest: "app/web/static/icons.js" } },
     { method: "fs.copy", params: { src: "web/static/Logo_1.png", dest: "app/web/static/Logo_1.png" } },
     { method: "fs.copy", params: { src: "web/static/default.jpg", dest: "app/web/static/default.jpg" } },
-    // 7. Apply flash attention fix for Windows compatibility (disables flash attn if not available)
+    // 8. Apply flash attention fix for Windows compatibility
     { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } }
   ]
 }
