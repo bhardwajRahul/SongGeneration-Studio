@@ -809,7 +809,10 @@ var App = () => {
                             {/* Advanced Settings */}
                             <Card>
                                 <div onClick={() => setShowAdvanced(!showAdvanced)} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer', marginBottom: showAdvanced ? '14px' : '0' }}>
-                                    <span style={{ fontSize: '13px', fontWeight: '500', color: '#888' }}>Advanced Settings</span>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                        <span style={{ fontSize: '13px', fontWeight: '500', color: '#888' }}>Advanced Settings</span>
+                                        {showAdvanced && <button onClick={(e) => { e.stopPropagation(); setCfgCoef(1.5); setTemperature(0.8); setTopK(50); setTopP(0.0); setExtendStride(5); }} style={{ fontSize: '10px', color: '#6366F1', background: 'none', border: '1px solid #6366F1', borderRadius: '4px', padding: '2px 6px', cursor: 'pointer' }}>Reset</button>}
+                                    </div>
                                     <ChevronIcon size={16} color="#666" rotated={showAdvanced} />
                                 </div>
                                 {showAdvanced && (
