@@ -1618,8 +1618,8 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                         </button>
                     </>
                 )}
-                {/* Stop button - show for currently generating OR library items with processing status */}
-                {(isGenerating || (!isQueued && (item.status === 'processing' || item.status === 'generating' || item.status === 'pending'))) && (
+                {/* Stop button - only for pending items (not actively processing - those can't be stopped) */}
+                {onStop && !isQueued && item.status === 'pending' && (
                     <button className="btn-icon btn-danger" onClick={onStop}>Stop</button>
                 )}
                 {isQueued && <button className="btn-icon btn-danger" onClick={onRemoveFromQueue}>Remove</button>}

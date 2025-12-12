@@ -274,15 +274,26 @@ var App = () => {
         console.log('[SETUP-TRACKING] === SETTING UP TRACKING FOR:', gen.id, '===');
 
         const meta = gen.metadata || {};
+        // Get model from multiple sources (queue items have model directly, library items have it in metadata)
+        const model = meta.model || gen.model || 'songgeneration_base';
+        // Get sections array - could be in metadata or directly on gen (for queue items)
+        const sections = Array.isArray(meta.sections) ? meta.sections : (Array.isArray(gen.sections) ? gen.sections : []);
+
         const payload = {
             title: meta.title || gen.title || 'Untitled',
-            model: meta.model || 'songgeneration_base',
-            sections: meta.sections || 5,
+            model,
+            sections,
             ...meta
         };
 
-        // Fetch fresh queue to ensure queue item is removed (backend removes it when starting)
-        const freshQueue = await fetchQueue();
+        // Fetch fresh queue AND timing stats to ensure we have up-to-date estimate
+        const [freshQueue, freshTimingStats] = await Promise.all([
+            fetchQueue(),
+            fetchTimingStats()
+        ]);
+
+        // Update timing stats state so future estimates use fresh data
+        setTimingStats(freshTimingStats);
 
         // Set all state in one batch - library AND queue together
         setLibrary(freshLibrary);
@@ -294,7 +305,12 @@ var App = () => {
 
         const hasStarted = gen.status !== 'pending' && typeof gen.elapsed_seconds === 'number';
         setElapsedTime(hasStarted ? gen.elapsed_seconds : 0);
-        setEstimatedTime(estimateTime(payload.model, Array.isArray(payload.sections) ? payload.sections : [], Boolean(payload.reference_audio_id)));
+        // Use fresh timing stats for the estimate - use metadata's stored values as fallback
+        const numSections = sections.length || meta.num_sections || 5;
+        const totalLyrics = sections.length > 0
+            ? sections.reduce((acc, s) => acc + (s.lyrics || '').length, 0)
+            : (meta.total_lyrics_length || 0);
+        setEstimatedTime(calculateEstimateFromValues(freshTimingStats, model, numSections, totalLyrics, Boolean(meta.reference_audio_id || gen.reference_audio_id)));
 
         // Start timer if generation has started
         if (hasStarted && !timerRef.current) {
@@ -347,7 +363,7 @@ var App = () => {
         }, 2000);
 
         console.log('[SETUP-TRACKING] === TRACKING SETUP COMPLETE ===');
-    }, [estimateTime]);
+    }, []);
 
     const cleanupGeneration = useCallback(async () => {
         console.log('[CLEANUP] === CLEANUP GENERATION CALLED ===');
@@ -515,7 +531,10 @@ var App = () => {
         console.log('[START-GEN] Sections:', payload.sections?.length);
         setProgress(0); setStatus('Starting...'); setError(null);
         setCurrentGenPayload(payload);
-        setEstimatedTime(estimateTime(payload.model, payload.sections, Boolean(payload.reference_audio_id)));
+        // Fetch fresh timing stats for accurate estimate
+        const freshStats = await fetchTimingStats();
+        setTimingStats(freshStats);
+        setEstimatedTime(calculateEstimate(freshStats, payload.model, payload.sections, Boolean(payload.reference_audio_id)));
         setElapsedTime(0);
         console.log('[START-GEN] Starting elapsed time counter');
         timerRef.current = setInterval(() => setElapsedTime(prev => prev + 1), 1000);
@@ -566,16 +585,6 @@ var App = () => {
             setGenerating(true);
             doStartGeneration(payload);
         }
-    };
-
-    const doStopGeneration = async (genId = null) => {
-        const idToStop = genId || currentGenId;
-        if (!idToStop) return;
-        try {
-            await stopGeneration(idToStop);
-            if (idToStop === currentGenId) setStatus('Stopping...');
-            await Promise.all([loadLibrary(), loadQueue()]);
-        } catch (e) { console.error('Failed to stop:', e); }
     };
 
     // Section handlers
@@ -939,7 +948,7 @@ var App = () => {
                                             {currentGenPayload ? (
                                                 <div className="activity-item processing" style={{ display: 'flex', gap: '10px', alignItems: 'center', position: 'relative', overflow: 'hidden' }}>
                                                     <div style={{ position: 'absolute', top: 0, left: 0, bottom: 0, width: estimatedTime > 0 && elapsedTime > 0 ? `${Math.min((elapsedTime / estimatedTime) * 100, 100)}%` : '0%', background: 'linear-gradient(90deg, rgba(245, 158, 11, 0.15) 0%, rgba(245, 158, 11, 0.05) 100%)', zIndex: 0, transition: 'width 0.5s ease' }} />
-                                                    <button onClick={() => doStopGeneration()} style={{ position: 'absolute', top: '4px', right: '4px', background: 'none', border: 'none', color: '#666', cursor: 'pointer', zIndex: 2 }}><CloseIcon size={10} /></button>
+                                                    {/* No stop button - running generations cannot be stopped */}
                                                     <div style={{ width: '44px', height: '44px', borderRadius: '6px', backgroundColor: '#F59E0B', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1 }}><SpinnerIcon size={18} /></div>
                                                     <div style={{ flex: 1, zIndex: 1 }}><div className="text-sm font-medium text-primary truncate">{currentGenPayload.title || 'Untitled'}</div><div className="text-xs text-secondary">{elapsedTime > 0 ? `${formatTime(elapsedTime)}${estimatedTime > 0 ? ` / ~${formatTime(estimatedTime)}` : ''}` : status || 'Starting...'}</div></div>
                                                 </div>
@@ -981,11 +990,11 @@ var App = () => {
                                     ));
                                 })()}
                                 {currentGenPayload ? (
-                                    <LibraryItem item={currentGenPayload} isGenerating onStop={doStopGeneration} status={status} elapsedTime={elapsedTime} estimatedTime={estimatedTime} />
+                                    <LibraryItem item={currentGenPayload} isGenerating status={status} elapsedTime={elapsedTime} estimatedTime={estimatedTime} />
                                 ) : generating && queue.length > 0 && (
                                     <LibraryItem item={{ title: 'Starting next song...', status: 'pending' }} isGenerating status="Please wait" elapsedTime={0} estimatedTime={0} />
                                 )}
-                                {library.filter(item => item.id !== currentGenId && !['generating', 'processing', 'pending'].includes(item.status)).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id).then(loadLibrary)} onPlay={audioPlayer.play} onUpdate={loadLibrary} onStop={() => doStopGeneration(item.id)} isCurrentlyPlaying={audioPlayer.playingId === item.id} isAudioPlaying={audioPlayer.isPlaying} />)}
+                                {library.filter(item => item.id !== currentGenId && !['generating', 'processing', 'pending'].includes(item.status)).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id).then(loadLibrary)} onPlay={audioPlayer.play} onUpdate={loadLibrary} isCurrentlyPlaying={audioPlayer.playingId === item.id} isAudioPlaying={audioPlayer.isPlaying} />)}
                             </div>
                         )}
                     </div>

@@ -499,29 +499,25 @@ async def get_generation_status(gen_id: str):
 
 @app.post("/api/stop/{gen_id}")
 async def stop_generation(gen_id: str):
-    from model_server import cancel_generation_on_server_async
+    """Stop a generation. Only works for queued (pending) generations, not actively processing ones."""
     import shutil
 
     if gen_id not in generations:
-        # Return success for non-existent generations (idempotent)
         return {"status": "stopped", "message": "Generation not found (already stopped or deleted)"}
 
     gen = generations[gen_id]
-    if gen["status"] not in ("pending", "processing"):
-        # Already in a terminal state - return success
+
+    # Cannot stop a generation that's actively processing (PyTorch inference can't be interrupted)
+    if gen["status"] == "processing":
+        raise HTTPException(400, "Cannot stop a generation in progress. Please wait for it to complete.")
+
+    if gen["status"] not in ("pending",):
+        # Already in a terminal state
         return {"status": gen["status"], "message": f"Generation already {gen['status']}"}
 
-    # Mark as stopped first
-    generations[gen_id]["status"] = "stopped"
-    generations[gen_id]["message"] = "Stopping..."
+    print(f"[STOP] Stopping pending generation {gen_id}", flush=True)
 
-    # Request cancellation from model server
-    try:
-        await cancel_generation_on_server_async()
-    except Exception as e:
-        print(f"[STOP] Failed to cancel on model server: {e}")
-
-    # Delete the generation from memory and clean up files
+    # Clean up files
     output_subdir = OUTPUT_DIR / gen_id
     if output_subdir.exists():
         try:
@@ -539,25 +535,31 @@ async def stop_generation(gen_id: str):
 
 @app.delete("/api/generation/{gen_id}")
 async def delete_generation(gen_id: str):
+    """Delete a generation. Cannot delete actively processing generations."""
+    import shutil
+
     if gen_id not in generations:
         raise HTTPException(404, "Generation not found")
 
     gen = generations[gen_id]
 
-    # If running, stop it first
-    if gen["status"] in ("pending", "processing"):
-        generations[gen_id]["status"] = "stopped"
-        generations[gen_id]["message"] = "Stopped and deleted"
-        notify_gen(gen_id, generations[gen_id])
-        notify_lib()
-        await notify_models()
+    # Cannot delete a generation that's actively processing
+    if gen["status"] == "processing":
+        raise HTTPException(400, "Cannot delete a generation in progress. Please wait for it to complete.")
 
-    import shutil
+    # If pending, just delete it
+    if gen["status"] == "pending":
+        print(f"[DELETE] Deleting pending generation {gen_id}", flush=True)
+
     output_subdir = OUTPUT_DIR / gen_id
     if output_subdir.exists():
         shutil.rmtree(output_subdir)
 
     del generations[gen_id]
+
+    notify_lib()
+    await notify_models()
+
     return {"status": "deleted"}
 
 

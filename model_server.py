@@ -427,6 +427,11 @@ if __name__ == "__main__":
         if state.model is None:
             return {"error": "No model loaded"}
 
+        # Reject concurrent generation requests
+        if state.generating:
+            print("[MODEL_SERVER] Rejecting request - generation already in progress", flush=True)
+            return {"error": "Generation already in progress", "status": "busy"}
+
         # Reset cancel flag and set generating
         state.cancel_requested = False
         state.generating = True

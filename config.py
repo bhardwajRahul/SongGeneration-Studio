@@ -34,7 +34,7 @@ MODEL_SERVER_URL = f"http://127.0.0.1:{MODEL_SERVER_PORT}"
 USE_MODEL_SERVER = True  # Set to False to use old subprocess method
 
 # Timing History
-MAX_TIMING_RECORDS = 100  # Keep last 100 successful generations
+MAX_TIMING_RECORDS = 1000  # Keep last 1000 successful generations
 
 # ============================================================================
 # Verified Models Cache

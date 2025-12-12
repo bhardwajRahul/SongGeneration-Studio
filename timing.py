@@ -151,21 +151,28 @@ def get_timing_stats() -> dict:
     # Calculate statistics with exponential weighting (recent records matter more)
     result = {"has_history": True, "models": {}}
 
+    # Only use last N records for EMA to be more responsive to recent performance
+    RECENT_RECORDS_FOR_EMA = 20
+
     for model, stats in model_stats.items():
         if not stats["all_times"]:
             continue
 
-        # Calculate weighted average (recent records have more weight)
-        def weighted_avg(times_list, alpha=0.3):
-            """Exponential moving average - recent values weighted more heavily"""
+        # Calculate weighted average using only recent records
+        def weighted_avg(times_list, alpha=0.5):
+            """Exponential moving average - only uses recent records for responsiveness"""
             if not times_list:
                 return None
-            if len(times_list) == 1:
-                return int(times_list[0])
 
-            # Start with oldest, apply EMA
-            ema = times_list[0]
-            for t in times_list[1:]:
+            # Only use last N records for more responsive estimates
+            recent = times_list[-RECENT_RECORDS_FOR_EMA:] if len(times_list) > RECENT_RECORDS_FOR_EMA else times_list
+
+            if len(recent) == 1:
+                return int(recent[0])
+
+            # Start with oldest of recent, apply EMA
+            ema = recent[0]
+            for t in recent[1:]:
                 ema = alpha * t + (1 - alpha) * ema
             return int(ema)
 

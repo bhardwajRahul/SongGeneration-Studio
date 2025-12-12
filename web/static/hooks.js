@@ -1,5 +1,80 @@
 // SongGeneration Studio - Custom Hooks
 
+// ============ Standalone Time Estimation Functions ============
+// Used when fresh timing stats are fetched and we need to calculate estimate immediately
+
+// Calculate estimate from pre-computed values (more reliable for queue items)
+var calculateEstimateFromValues = (timingStats, model, numSections, totalLyrics, hasReference = false) => {
+    const hasLyrics = totalLyrics > 0;
+
+    // Get model defaults
+    const baseTime = MODEL_BASE_TIMES[model] || 180;
+    const maxAdditional = MODEL_MAX_ADDITIONAL[model] || 180;
+
+    // Calculate complexity factor (0 to 1)
+    const sectionFactor = Math.min(1, Math.max(0, (numSections - 1) / 9));
+    const lyricsFactor = Math.min(1, totalLyrics / 2000);
+    const complexity = (sectionFactor * 0.4) + (lyricsFactor * 0.6);
+
+    // Calculate default estimate
+    let defaultEstimate = baseTime + Math.round(complexity * maxAdditional);
+    if (hasReference) defaultEstimate += 30;
+
+    // Determine complexity bucket
+    const getComplexityBucket = (sections, lyrics) => {
+        const sectionScore = sections <= 3 ? 0 : (sections <= 6 ? 1 : 2);
+        let lyricsScore = 0;
+        if (lyrics > 0 && lyrics <= 500) lyricsScore = 1;
+        else if (lyrics > 500 && lyrics <= 1500) lyricsScore = 2;
+        else if (lyrics > 1500) lyricsScore = 3;
+        const total = sectionScore + lyricsScore;
+        if (total <= 1) return "low";
+        if (total <= 3) return "medium";
+        if (total <= 4) return "high";
+        return "very_high";
+    };
+
+    const bucket = getComplexityBucket(numSections, totalLyrics);
+
+    // If we have history, blend with learned values
+    if (timingStats?.has_history && timingStats.models?.[model]) {
+        const modelStats = timingStats.models[model];
+        const recordCount = modelStats.count || 0;
+        let learnedEstimate = null;
+
+        if (modelStats.by_bucket?.[bucket]) {
+            learnedEstimate = modelStats.by_bucket[bucket];
+        } else if (hasLyrics && modelStats.avg_with_lyrics) {
+            learnedEstimate = modelStats.avg_with_lyrics;
+        } else if (!hasLyrics && modelStats.avg_without_lyrics) {
+            learnedEstimate = modelStats.avg_without_lyrics;
+        } else if (modelStats.avg_time) {
+            learnedEstimate = modelStats.avg_time;
+        }
+
+        if (learnedEstimate) {
+            if (hasReference && modelStats.avg_with_reference && modelStats.avg_without_reference) {
+                const refRatio = modelStats.avg_with_reference / modelStats.avg_without_reference;
+                learnedEstimate = Math.round(learnedEstimate * refRatio);
+            }
+            const confidence = Math.min(0.95, 0.5 + (recordCount * 0.09));
+            const blendedEstimate = Math.round(
+                (learnedEstimate * confidence) + (defaultEstimate * (1 - confidence))
+            );
+            return Math.max(60, blendedEstimate);
+        }
+    }
+
+    return Math.max(60, defaultEstimate);
+};
+
+// Calculate estimate from sections array (wrapper for backward compatibility)
+var calculateEstimate = (timingStats, model, sectionsList, hasReference = false) => {
+    const numSections = sectionsList.length;
+    const totalLyrics = sectionsList.reduce((acc, s) => acc + (s.lyrics || '').length, 0);
+    return calculateEstimateFromValues(timingStats, model, numSections, totalLyrics, hasReference);
+};
+
 // ============ Hover Hook ============
 var useHover = () => {
     const [isHovered, setIsHovered] = useState(false);
