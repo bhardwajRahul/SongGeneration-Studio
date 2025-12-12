@@ -336,6 +336,13 @@ async def run_generation(
             if description:
                 input_data["descriptions"] = description
 
+        # Add advanced generation parameters
+        input_data["cfg_coef"] = request.cfg_coef
+        input_data["temperature"] = request.temperature
+        input_data["top_k"] = request.top_k
+        input_data["top_p"] = request.top_p
+        input_data["extend_stride"] = request.extend_stride
+
         print(f"[GEN {gen_id}] Lyrics: {lyrics[:200]}...")
         print(f"[GEN {gen_id}] Input data: {json.dumps(input_data, indent=2)}")
 

@@ -443,6 +443,19 @@ if __name__ == "__main__":
             prompt_audio = input_data.get("prompt_audio_path", None)
             auto_prompt_type = input_data.get("auto_prompt_audio_type", None)
 
+            # Get advanced generation parameters
+            gen_params = {}
+            if "cfg_coef" in input_data:
+                gen_params["cfg_coef"] = input_data["cfg_coef"]
+            if "temperature" in input_data:
+                gen_params["temperature"] = input_data["temperature"]
+            if "top_k" in input_data:
+                gen_params["top_k"] = input_data["top_k"]
+            if "top_p" in input_data:
+                gen_params["top_p"] = input_data["top_p"]
+            if "extend_stride" in input_data:
+                gen_params["extend_stride"] = input_data["extend_stride"]
+
             # Get auto prompt path
             auto_prompt_path = None
             if auto_prompt_type and auto_prompt_type != "Auto":
@@ -451,6 +464,8 @@ if __name__ == "__main__":
             print(f"[MODEL_SERVER] Lyric: {lyric[:100]}...", flush=True)
             print(f"[MODEL_SERVER] Description: {description}", flush=True)
             print(f"[MODEL_SERVER] Gen type: {req.gen_type}", flush=True)
+            if gen_params:
+                print(f"[MODEL_SERVER] Gen params: {gen_params}", flush=True)
 
             # Run inference
             start_time = time.time()
@@ -460,7 +475,8 @@ if __name__ == "__main__":
                 prompt_audio_path=prompt_audio,
                 genre=auto_prompt_type,
                 auto_prompt_path=auto_prompt_path,
-                gen_type=req.gen_type
+                gen_type=req.gen_type,
+                params=gen_params
             )
             gen_time = time.time() - start_time
 
