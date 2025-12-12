@@ -419,8 +419,11 @@ var App = () => {
             // Backend hasn't started next gen yet - poll until it does
             console.log('[CLEANUP] Next gen not in library yet, starting transition poll');
 
-            // Update library state now (to show "Starting next song...")
+            // Update BOTH library AND queue state now to prevent ghost items
+            // (queue item may have been popped by backend but our state is stale)
+            const freshQueue = await fetchQueue();
             setLibrary(freshLib);
+            setQueue(freshQueue);
 
             pollRef.current = setInterval(async () => {
                 try {
