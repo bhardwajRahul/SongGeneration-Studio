@@ -388,8 +388,8 @@ var AudioTrimmer = ({ onAccept, onClear, onFileLoad }) => {
     const handleAccept = async () => {
         stopPlayback();
 
-        if (!audioBufferRef.current) {
-            setError('Audio not loaded yet');
+        if (!file) {
+            setError('No file selected');
             return;
         }
 
@@ -397,35 +397,13 @@ var AudioTrimmer = ({ onAccept, onClear, onFileLoad }) => {
         setError(null);
 
         try {
-            const sourceBuffer = audioBufferRef.current;
-            const sampleRate = sourceBuffer.sampleRate;
-            const startSample = Math.floor(regionStart * sampleRate);
-            const numSamples = Math.floor(clipDuration * sampleRate);
-
-            if (!audioContextRef.current) {
-                audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-            }
-
-            const trimmedBuffer = audioContextRef.current.createBuffer(
-                sourceBuffer.numberOfChannels,
-                numSamples,
-                sampleRate
-            );
-
-            for (let ch = 0; ch < sourceBuffer.numberOfChannels; ch++) {
-                const src = sourceBuffer.getChannelData(ch);
-                const dst = trimmedBuffer.getChannelData(ch);
-                for (let i = 0; i < numSamples && (startSample + i) < src.length; i++) {
-                    dst[i] = src[startSample + i];
-                }
-            }
-
-            const wavBlob = audioBufferToWav(trimmedBuffer);
-
+            // Send original file to server for high-quality trimming with ffmpeg
             const formData = new FormData();
-            formData.append('file', wavBlob, `trimmed_${file.name.replace(/\.[^.]+$/, '')}.wav`);
+            formData.append('file', file);
+            formData.append('trim_start', regionStart.toString());
+            formData.append('trim_duration', clipDuration.toString());
 
-            const response = await fetch('/api/upload-reference', {
+            const response = await fetch('/api/upload-and-trim-reference', {
                 method: 'POST',
                 body: formData
             });

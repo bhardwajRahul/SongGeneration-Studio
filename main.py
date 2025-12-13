@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Response, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Response, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -427,6 +427,59 @@ async def upload_reference(file: UploadFile = File(...)):
         f.write(content)
 
     return {"id": file_id, "filename": file.filename}
+
+
+@app.post("/api/upload-and-trim-reference")
+async def upload_and_trim_reference(
+    file: UploadFile = File(...),
+    trim_start: float = Form(0.0),
+    trim_duration: float = Form(10.0)
+):
+    """Upload audio and trim it server-side using ffmpeg to preserve quality."""
+    allowed_ext = ('.wav', '.mp3', '.flac', '.ogg')
+    if not file.filename.lower().endswith(allowed_ext):
+        raise HTTPException(400, f"Invalid file type. Allowed: {allowed_ext}")
+
+    file_id = str(uuid.uuid4())
+
+    # Save original file temporarily
+    original_ext = Path(file.filename).suffix.lower()
+    temp_original = UPLOADS_DIR / f"temp_{file_id}{original_ext}"
+
+    content = await file.read()
+    with open(temp_original, 'wb') as f:
+        f.write(content)
+
+    try:
+        # Output as FLAC for best quality preservation
+        trimmed_filename = f"trimmed_{Path(file.filename).stem}.flac"
+        trimmed_path = UPLOADS_DIR / f"{file_id}_{trimmed_filename}"
+
+        # Use ffmpeg to trim with highest quality settings
+        # -ss before -i for fast seeking, -t for duration
+        # -c:a flac for lossless compression
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(trim_start),
+            '-i', str(temp_original),
+            '-t', str(trim_duration),
+            '-c:a', 'flac',
+            '-compression_level', '8',
+            str(trimmed_path)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if result.returncode != 0:
+            print(f"[API] ffmpeg trim failed: {result.stderr}")
+            raise HTTPException(500, f"Failed to trim audio: {result.stderr}")
+
+        return {"id": file_id, "filename": trimmed_filename}
+
+    finally:
+        # Clean up temp file
+        if temp_original.exists():
+            temp_original.unlink()
 
 
 @app.get("/api/reference/{ref_id}")

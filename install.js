@@ -70,6 +70,8 @@ module.exports = {
     { method: "fs.copy", params: { src: "web/static/Logo_1.png", dest: "app/web/static/Logo_1.png" } },
     { method: "fs.copy", params: { src: "web/static/default.jpg", dest: "app/web/static/default.jpg" } },
     // 8. Apply flash attention fix for Windows compatibility
-    { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } }
+    { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } },
+    // 9. Apply Demucs 24-bit quality fix (was 16-bit)
+    { method: "fs.copy", params: { src: "patches/demucs/apply.py", dest: "app/third_party/demucs/models/apply.py" } }
   ]
 }
