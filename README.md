@@ -1,168 +1,130 @@
 # SongGeneration Studio
 
-AI Song Generation with Full Style Control using Tencent AI Lab's SongGeneration (LeVo) model.
+<div align="center">
+
+![SongGeneration Studio](icon.png)
+
+**Create complete AI-generated songs with vocals, lyrics, and full instrumental tracks**
+
+*Powered by Tencent AI Lab's LeVo model*
+
+---
+
+[Features](#features) | [Requirements](#requirements) | [Installation](#installation) | [How to Use](#how-to-use) | [Credits](#credits)
+
+</div>
 
 ## Features
 
-- **Full Song Generation**: Generate complete songs with vocals and instrumental tracks
-- **Style Control**: Control gender, timbre, genre, emotion, instruments, and BPM
-- **Lyrics Support**: Input your own lyrics with section markers (intro, verse, chorus, bridge, outro)
-- **Reference Audio**: Use a reference audio file to guide the style of generation
-- **Multiple Output Modes**: Generate mixed, vocals only, instrumental only, or separate tracks
-- **Web UI**: Easy-to-use web interface for song creation
+### Complete Song Creation
+Generate full songs from scratch with AI-powered vocals and instrumentals. Just write your lyrics, pick a style, and let the AI create your music.
+
+### Style Control
+Fine-tune every aspect of your song:
+- **Genre** - Pop, Rock, Hip-Hop, R&B, Electronic, Jazz, Metal, Folk, and more
+- **Mood** - Happy, Sad, Energetic, Romantic, Melancholic, Uplifting, Dark, Dreamy...
+- **Voice** - Male or Female vocals with customizable timbre (Warm, Bright, Soft, Powerful...)
+- **Instruments** - Specify exactly what you want: piano, guitar, drums, synths, strings...
+- **Tempo** - Set your BPM from slow ballads to high-energy tracks
+
+### Song Structure
+Build your song with intuitive section blocks:
+- **Intro** / **Outro** - Instrumental openings and endings (short, medium, or long)
+- **Verse** - Tell your story
+- **Chorus** - The hook that sticks
+- **Bridge** - Add contrast and build tension
+- **Pre-Chorus** - Build up to the chorus
+- **Instrumental** - Let the music breathe
+
+### Style Cloning
+Upload a reference audio file and the AI will match its style, mood, and vibe in your new song.
+
+### Separate Stems
+Generate your song with individual tracks:
+- **Full Mix** - The complete song
+- **Vocals Only** - Isolated vocal track
+- **Instrumental Only** - Just the music, no vocals
+
+Perfect for remixing, karaoke, or further production.
+
+### Built-in Library
+- Save and organize all your generations
+- Custom cover art for each song
+- Edit titles and metadata
+- Export to FLAC or MP4 video
+- Queue multiple songs for batch generation
+
+---
 
 ## Requirements
 
-- **GPU**: NVIDIA GPU with at least 10GB VRAM (24GB+ recommended for full quality)
-- **Storage**: ~25GB for models and dependencies
-- **OS**: Windows, macOS, or Linux
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| **GPU** | NVIDIA 10GB VRAM | NVIDIA 24GB+ VRAM |
+| **Storage** | 25GB free space | 50GB+ free space |
+| **OS** | Windows 10/11, macOS, Linux | - |
+
+---
 
 ## Installation
 
-1. Open Pinokio
-2. Find "SongGeneration Studio" in the app list
-3. Click "Install"
-4. Wait for the installation to complete (this may take a while due to large model downloads)
+1. Open **Pinokio**
+2. Search for **"SongGeneration Studio"**
+3. Click **Install**
+4. Wait for models to download (~15GB)
 
-## Usage
+That's it! The installer handles everything automatically.
 
-1. Click "Start" to launch the server
-2. The Web UI will open automatically in your browser
-3. Create your song:
-   - Enter a song title
-   - Add song sections (intro, verse, chorus, etc.) with lyrics
-   - Configure style settings (genre, emotion, voice, instruments)
-   - Optionally upload a reference audio file
-4. Click "Generate Song" and wait for the generation to complete
-5. Play and download your generated song
+---
 
-## Song Sections
+## How to Use
 
-The following section types are supported:
+### Getting Started
 
-| Section | Description |
-|---------|-------------|
-| `intro-short` / `intro` / `intro-long` | Song introduction |
-| `verse` / `verse-short` / `verse-long` | Main verses |
-| `chorus` / `chorus-short` / `chorus-long` | Song chorus |
-| `bridge` / `bridge-short` / `bridge-long` | Bridge section |
-| `outro-short` / `outro` / `outro-long` | Song ending |
-| `break` | Musical break |
-| `solo` | Instrumental solo |
+1. Click **Start** to launch the app
+2. The Web UI opens automatically in your browser
 
-## Style Settings
+### Creating Your First Song
 
-- **Voice Gender**: Female or Male
-- **Timbre**: Bright, Dark, Soft, Powerful, Warm, Clear, Raspy, Smooth
-- **Genre**: Pop, Rock, Metal, Jazz, R&B, Folk, Dance/Electronic, Reggae, Chinese Style
-- **Emotion**: Happy, Sad, Energetic, Romantic, Angry, Peaceful, Melancholic, Hopeful
-- **Instruments**: Specify instruments (e.g., "piano and drums", "electric guitar, bass, drums")
-- **BPM**: Tempo (60-200)
+**Step 1: Write Your Lyrics**
+- Add sections using the + button (Verse, Chorus, Bridge, etc.)
+- Type your lyrics in each section
+- Drag sections to reorder them
+- Adjust intro/outro length by dragging the edges
 
-## API Documentation
+**Step 2: Set Your Style**
+- Choose a genre or type your own
+- Pick the mood/emotion
+- Select voice gender and timbre
+- Add specific instruments
+- Set the tempo (BPM)
 
-### Generate a Song
+**Step 3: Optional - Add Reference Audio**
+- Upload a song you like
+- The AI will match its style and energy
 
-```javascript
-// JavaScript
-const response = await fetch('/api/generate', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    title: "My Song",
-    sections: [
-      { type: "intro-short", lyrics: null },
-      { type: "verse", lyrics: "Walking through the city lights" },
-      { type: "chorus", lyrics: "We are alive, we are on fire" },
-      { type: "outro-short", lyrics: null }
-    ],
-    gender: "female",
-    timbre: "bright",
-    genre: "Pop",
-    emotion: "happy",
-    instruments: "piano and drums",
-    bpm: 120,
-    output_mode: "mixed"
-  })
-});
-const { generation_id } = await response.json();
-```
+**Step 4: Generate**
+- Click **Generate Song**
+- Wait for the magic (3-6 minutes depending on song length)
+- Your song appears in the library when complete
 
-```python
-# Python
-import requests
+### Tips for Better Results
 
-response = requests.post('http://localhost:8000/api/generate', json={
-    'title': 'My Song',
-    'sections': [
-        {'type': 'intro-short', 'lyrics': None},
-        {'type': 'verse', 'lyrics': 'Walking through the city lights'},
-        {'type': 'chorus', 'lyrics': 'We are alive, we are on fire'},
-        {'type': 'outro-short', 'lyrics': None}
-    ],
-    'gender': 'female',
-    'timbre': 'bright',
-    'genre': 'Pop',
-    'emotion': 'happy',
-    'instruments': 'piano and drums',
-    'bpm': 120,
-    'output_mode': 'mixed'
-})
-generation_id = response.json()['generation_id']
-```
+- **Be specific with lyrics** - Clear, well-structured lyrics produce better vocals
+- **Match genre and mood** - "Happy" + "Metal" might give unexpected results
+- **Use reference audio** - This significantly improves style consistency
+- **Experiment with timbre** - Small changes can dramatically affect the vocal character
+- **Keep sections balanced** - Very long songs may have quality variations
 
-```bash
-# cURL
-curl -X POST http://localhost:8000/api/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "My Song",
-    "sections": [
-      {"type": "intro-short", "lyrics": null},
-      {"type": "verse", "lyrics": "Walking through the city lights"},
-      {"type": "chorus", "lyrics": "We are alive, we are on fire"},
-      {"type": "outro-short", "lyrics": null}
-    ],
-    "gender": "female",
-    "timbre": "bright",
-    "genre": "Pop",
-    "emotion": "happy",
-    "instruments": "piano and drums",
-    "bpm": 120,
-    "output_mode": "mixed"
-  }'
-```
-
-### Check Generation Status
-
-```bash
-curl http://localhost:8000/api/generation/{generation_id}
-```
-
-### Download Generated Audio
-
-```bash
-curl http://localhost:8000/api/audio/{generation_id}/0 --output song.wav
-```
-
-### API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/health` | GET | Health check and GPU status |
-| `/api/models` | GET | List available models |
-| `/api/presets` | GET | Get available style presets |
-| `/api/generate` | POST | Start a new song generation |
-| `/api/generation/{id}` | GET | Get generation status |
-| `/api/generations` | GET | List all generations |
-| `/api/audio/{id}/{track}` | GET | Download generated audio track |
-| `/api/upload-reference` | POST | Upload a reference audio file |
+---
 
 ## Credits
 
-- **SongGeneration (LeVo)**: [Tencent AI Lab](https://github.com/tencent-ailab/SongGeneration)
-- **Pinokio Launcher**: This installer
+- **LeVo Model** by [Tencent AI Lab](https://github.com/AisingioroHao0/SongGeneration) - The AI engine powering song generation
+- **Pinokio** - One-click installation and launcher
+
+---
 
 ## License
 
-This launcher is provided for educational and research purposes. Please refer to the original [SongGeneration repository](https://github.com/tencent-ailab/SongGeneration) for licensing information.
+This launcher is provided for personal, educational, and research purposes. See the original [SongGeneration repository](https://github.com/AisingioroHao0/SongGeneration) for model licensing details.
