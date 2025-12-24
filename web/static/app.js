@@ -723,6 +723,12 @@ var App = () => {
                         </button>
                     ))}
                 </div>
+                <a href="https://github.com/BazedFrog/SongGeneration-Studio" target="_blank" rel="noopener noreferrer"
+                    style={{ position: 'absolute', right: '24px', display: 'flex', alignItems: 'center', gap: '6px', color: '#666', textDecoration: 'none', padding: '8px 12px', borderRadius: '8px', transition: 'all 0.15s' }}
+                    onMouseEnter={e => { e.currentTarget.style.color = '#fff'; e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.1)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.color = '#666'; e.currentTarget.style.backgroundColor = 'transparent'; }}>
+                    <GitHubIcon size={18} />
+                </a>
             </header>
 
             {/* Main Content */}
