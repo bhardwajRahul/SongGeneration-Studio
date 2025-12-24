@@ -191,6 +191,7 @@ var useModels = () => {
 var useAudioPlayer = (library) => {
     const [playingId, setPlayingId] = useState(null);
     const [playingItem, setPlayingItem] = useState(null);
+    const [playingTrackIdx, setPlayingTrackIdx] = useState(0);
     const [isPlaying, setIsPlaying] = useState(false);
     const [progress, setProgress] = useState(0);
     const [duration, setDuration] = useState(0);
@@ -210,11 +211,11 @@ var useAudioPlayer = (library) => {
         if (audioRef.current) audioRef.current.volume = vol;
     }, []);
 
-    const play = useCallback((item) => {
+    const play = useCallback((item, trackIdx = 0) => {
         if (!item.output_file && (!item.output_files || item.output_files.length === 0)) return;
 
-        // Toggle play/pause for same item
-        if (playingId === item.id && audioRef.current) {
+        // Toggle play/pause for same item and same track
+        if (playingId === item.id && playingTrackIdx === trackIdx && audioRef.current) {
             if (audioRef.current.paused) {
                 audioRef.current.play().then(() => setIsPlaying(true));
             } else {
@@ -233,6 +234,7 @@ var useAudioPlayer = (library) => {
 
         setPlayingId(item.id);
         setPlayingItem(item);
+        setPlayingTrackIdx(trackIdx);
         setProgress(0);
         setDuration(0);
         setIsPlaying(true);
@@ -249,10 +251,10 @@ var useAudioPlayer = (library) => {
         audio.onerror = () => setIsPlaying(false);
         audio.ontimeupdate = () => setProgress(audio.currentTime);
         audio.onloadedmetadata = () => setDuration(audio.duration);
-        audio.src = `/api/audio/${item.id}/0`;
+        audio.src = `/api/audio/${item.id}/${trackIdx}`;
         audioRef.current = audio;
         audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
-    }, [playingId, volume]);
+    }, [playingId, playingTrackIdx, volume]);
 
     const playNext = useCallback(() => {
         if (!playingItem) return;
@@ -282,7 +284,7 @@ var useAudioPlayer = (library) => {
     }, [library, playingItem]);
 
     return {
-        playingId, playingItem, isPlaying, progress, duration, volume,
+        playingId, playingItem, playingTrackIdx, isPlaying, progress, duration, volume,
         play, seek, setVolume: setVolumeHandler, playNext, playPrev,
     };
 };

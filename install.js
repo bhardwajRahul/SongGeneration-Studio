@@ -72,6 +72,8 @@ module.exports = {
     // 8. Apply flash attention fix for Windows compatibility
     { method: "fs.copy", params: { src: "patches/builders.py", dest: "app/codeclm/models/builders.py" } },
     // 9. Apply Demucs 24-bit quality fix (was 16-bit)
-    { method: "fs.copy", params: { src: "patches/demucs/apply.py", dest: "app/third_party/demucs/models/apply.py" } }
+    { method: "fs.copy", params: { src: "patches/demucs/apply.py", dest: "app/third_party/demucs/models/apply.py" } },
+    // 10. Apply separate mode fix (generate tokens once, decode 3 times for vocal/bgm/mixed)
+    { method: "fs.copy", params: { src: "patches/gradio/levo_inference_lowmem.py", dest: "app/tools/gradio/levo_inference_lowmem.py" } }
   ]
 }

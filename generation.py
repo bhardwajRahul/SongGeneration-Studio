@@ -229,6 +229,34 @@ def restore_library():
                 except Exception as e:
                     print(f"[LIBRARY] Warning: Could not save duration for {gen_id}: {e}")
 
+        # Determine output_mode and track_labels from files
+        output_mode = metadata.get("output_mode", "mixed")
+        track_labels = []
+        ordered_files = list(audio_files)
+
+        # Check if this is a separate mode generation (has vocal and bgm files)
+        file_names = [f.stem for f in audio_files]
+        has_vocal = any(n.endswith('_vocal') for n in file_names)
+        has_bgm = any(n.endswith('_bgm') for n in file_names)
+
+        if has_vocal and has_bgm:
+            # This is a separate mode generation - order the files
+            main_file = None
+            vocal_file = None
+            bgm_file = None
+            for f in audio_files:
+                if f.stem.endswith('_vocal'):
+                    vocal_file = f
+                elif f.stem.endswith('_bgm'):
+                    bgm_file = f
+                else:
+                    main_file = f
+            ordered_files = [f for f in [main_file, vocal_file, bgm_file] if f]
+            track_labels = ["Full Song", "Vocals", "Instrumental"]
+            output_mode = "separate"
+        else:
+            track_labels = ["Full Song"] if output_mode == 'mixed' else ["Vocals" if output_mode == 'vocal' else "Instrumental"]
+
         generations[gen_id] = {
             "id": gen_id,
             "status": "completed",
@@ -239,9 +267,11 @@ def restore_library():
             "created_at": metadata.get("created_at", file_mtime),
             "completed_at": metadata.get("completed_at", file_mtime),
             "duration": duration,
-            "output_files": [str(f) for f in audio_files],
-            "audio_files": [f.name for f in audio_files],
+            "output_files": [str(f) for f in ordered_files],
+            "audio_files": [f.name for f in ordered_files],
             "output_dir": str(subdir),
+            "track_labels": track_labels,
+            "output_mode": output_mode,
             "metadata": metadata if metadata else {
                 "title": "Untitled",
                 "model": "unknown",
@@ -445,6 +475,28 @@ async def run_generation(
             if not output_files:
                 raise Exception("No output files generated")
 
+            # For separate mode, order files and create labels
+            gen_type = request.output_mode or "mixed"
+            track_labels = []
+            if gen_type == 'separate' and len(output_files) >= 3:
+                # Sort files: main file first, then vocal, then bgm
+                main_file = None
+                vocal_file = None
+                bgm_file = None
+                for f in output_files:
+                    name = f.stem
+                    if name.endswith('_vocal'):
+                        vocal_file = f
+                    elif name.endswith('_bgm'):
+                        bgm_file = f
+                    else:
+                        main_file = f
+                output_files = [f for f in [main_file, vocal_file, bgm_file] if f]
+                track_labels = ["Full Song", "Vocals", "Instrumental"]
+            else:
+                # Single file mode
+                track_labels = ["Full Song"] if gen_type == 'mixed' else ["Vocals" if gen_type == 'vocal' else "Instrumental"]
+
             audio_duration = None
             if output_files:
                 audio_duration = get_audio_duration(output_files[0])
@@ -454,6 +506,8 @@ async def run_generation(
             generations[gen_id]["message"] = "Song generated successfully!"
             generations[gen_id]["output_files"] = [str(f) for f in output_files]
             generations[gen_id]["output_file"] = str(output_files[0])
+            generations[gen_id]["track_labels"] = track_labels
+            generations[gen_id]["output_mode"] = gen_type
             generations[gen_id]["completed_at"] = datetime.now().isoformat()
             generations[gen_id]["duration"] = audio_duration
 
@@ -483,6 +537,7 @@ async def run_generation(
                     "has_lyrics": has_lyrics,
                     "total_lyrics_length": total_lyrics_length,
                     "used_model_server": True,
+                    "reference_audio_id": request.reference_audio_id,
                 }
                 with open(metadata_path, 'w', encoding='utf-8') as f:
                     json.dump(metadata, f, indent=2, ensure_ascii=False)

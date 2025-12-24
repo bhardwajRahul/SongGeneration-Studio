@@ -1404,12 +1404,17 @@ var EditModal = ({ item, onClose, onSave }) => {
 };
 
 // Library item component
-var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQueue, onStop, onDelete, onPlay, onUpdate, isCurrentlyPlaying, isAudioPlaying, status, elapsedTime, estimatedTime }) => {
+var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQueue, onStop, onDelete, onPlay, onUpdate, isCurrentlyPlaying, isAudioPlaying, playingTrackIdx, status, elapsedTime, estimatedTime }) => {
     const [expanded, setExpanded] = useState(false);
     const [editing, setEditing] = useState(false);
     const [exportingMp4, setExportingMp4] = useState(false);
     const [exportError, setExportError] = useState(null);
+    const [selectedTrack, setSelectedTrack] = useState(0);
     const meta = (isQueued || isGenerating) ? item : (item.metadata || {});
+
+    // Track info for separate mode
+    const trackLabels = item.track_labels || [];
+    const hasMultipleTracks = (item.output_files?.length || 0) > 1 && trackLabels.length > 1;
     const hasReference = !!(meta.reference_audio || meta.reference_audio_id);
 
     // Use a stable cache key based on cover filename (changes when cover is updated)
@@ -1557,6 +1562,7 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                     {meta.genre && <span className="tag tag-purple">{meta.genre}</span>}
                     {meta.emotion && <span className="tag tag-warning">{meta.emotion}</span>}
                     {meta.bpm && <span className="tag tag-primary">{meta.bpm} BPM</span>}
+                    {hasMultipleTracks && <span className="tag" style={{ backgroundColor: 'rgba(16, 185, 129, 0.2)', color: '#10B981' }}>Stems</span>}
                     {hasReference && <span className="tag" style={{ backgroundColor: 'rgba(139, 92, 246, 0.2)', color: '#8B5CF6' }}>Style Clone</span>}
                 </div>
             </div>
@@ -1610,6 +1616,70 @@ var LibraryItem = ({ item, isQueued, isGenerating, queuePosition, onRemoveFromQu
                 )}
             </div>
             </div>
+
+            {/* Track Selector for Separate Mode */}
+            {hasMultipleTracks && canPlay && (
+                <div style={{
+                    display: 'flex',
+                    gap: '8px',
+                    alignItems: 'center',
+                    padding: '8px 12px',
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(16, 185, 129, 0.2)',
+                }}>
+                    <span style={{ color: '#10B981', fontSize: '12px', fontWeight: '500' }}>Tracks:</span>
+                    {trackLabels.map((label, idx) => {
+                        const isThisTrackPlaying = isCurrentlyPlaying && playingTrackIdx === idx;
+                        return (
+                            <button
+                                key={idx}
+                                onClick={() => onPlay && onPlay(item, idx)}
+                                style={{
+                                    padding: '6px 12px',
+                                    borderRadius: '6px',
+                                    border: isThisTrackPlaying ? '1px solid #10B981' : '1px solid #333',
+                                    backgroundColor: isThisTrackPlaying ? 'rgba(16, 185, 129, 0.2)' : '#1a1a1a',
+                                    color: isThisTrackPlaying ? '#10B981' : '#888',
+                                    fontSize: '12px',
+                                    cursor: 'pointer',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '6px',
+                                    transition: 'all 0.15s ease',
+                                }}
+                            >
+                                {isThisTrackPlaying && isAudioPlaying && (
+                                    <span style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                                        <span style={{ width: '3px', height: '10px', backgroundColor: '#10B981', borderRadius: '1px', animation: 'pulse 0.5s ease-in-out infinite alternate' }}></span>
+                                        <span style={{ width: '3px', height: '14px', backgroundColor: '#10B981', borderRadius: '1px', animation: 'pulse 0.5s ease-in-out infinite alternate', animationDelay: '0.1s' }}></span>
+                                        <span style={{ width: '3px', height: '8px', backgroundColor: '#10B981', borderRadius: '1px', animation: 'pulse 0.5s ease-in-out infinite alternate', animationDelay: '0.2s' }}></span>
+                                    </span>
+                                )}
+                                {label}
+                            </button>
+                        );
+                    })}
+                    <div style={{ flex: 1 }}></div>
+                    <span style={{ color: '#666', fontSize: '11px' }}>Download:</span>
+                    {trackLabels.map((label, idx) => (
+                        <button
+                            key={`dl-${idx}`}
+                            className="btn-icon btn-success"
+                            style={{ padding: '4px 8px', fontSize: '10px' }}
+                            onClick={() => {
+                                const a = document.createElement('a');
+                                a.href = `/api/audio/${item.id}/${idx}?format=flac`;
+                                a.download = `${item.title || 'song'}_${label.toLowerCase().replace(' ', '_')}.flac`;
+                                a.click();
+                            }}
+                            title={`Download ${label}`}
+                        >
+                            {label === 'Full Song' ? 'Full' : label === 'Vocals' ? 'Voc' : 'Inst'}
+                        </button>
+                    ))}
+                </div>
+            )}
 
             {/* Edit Modal */}
             {editing && (
@@ -1711,6 +1781,7 @@ var SongsPanelItem = ({ item, audioPlayer, onDelete }) => {
     const canPlay = item.status === 'completed' && (item.output_file || item.output_files?.length > 0);
     const coverUrl = meta.cover ? `/api/generation/${item.id}/cover?v=${encodeURIComponent(meta.cover)}` : null;
     const hasReference = !!(meta.reference_audio || meta.reference_audio_id);
+    const hasSeparateTracks = (item.track_labels?.length || 0) > 1 || item.output_mode === 'separate';
 
     const showOverlay = canPlay && coverUrl && (isHovered || (isPlaying && isAudioPlaying));
 
@@ -1747,6 +1818,16 @@ var SongsPanelItem = ({ item, audioPlayer, onDelete }) => {
                     </div>
                 )}
                 {item.status === 'failed' && <CloseIcon color="#fff" />}
+                {/* Separate tracks indicator */}
+                {hasSeparateTracks && (
+                    <div style={{
+                        position: 'absolute', bottom: '-2px', left: '-2px',
+                        width: '14px', height: '14px', borderRadius: '50%',
+                        backgroundColor: '#10B981', border: '2px solid #1e1e1e',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: '8px', color: '#fff', fontWeight: 'bold'
+                    }} title="Has separate vocal & instrumental tracks">3</div>
+                )}
                 {/* Reference audio indicator */}
                 {hasReference && (
                     <div style={{

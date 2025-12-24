@@ -474,7 +474,7 @@ if __name__ == "__main__":
 
             # Run inference
             start_time = time.time()
-            audio_data = state.model(
+            audio_result = state.model(
                 lyric=lyric,
                 description=description,
                 prompt_audio_path=prompt_audio,
@@ -499,14 +499,32 @@ if __name__ == "__main__":
             audios_dir = save_dir / "audios"
             audios_dir.mkdir(parents=True, exist_ok=True)
 
-            # Convert to numpy and save
-            audio_np = audio_data.cpu().permute(1, 0).float().numpy()
             sample_rate = state.model.cfg.sample_rate
+            idx = input_data.get('idx', 'output')
 
-            output_file = audios_dir / f"{input_data.get('idx', 'output')}.flac"
-            sf.write(str(output_file), audio_np, sample_rate)
+            # Handle 'separate' mode: audio_result is a dict with 'mixed', 'vocal', 'bgm' keys
+            if req.gen_type == 'separate' and isinstance(audio_result, dict):
+                output_file = audios_dir / f"{idx}.flac"
+                output_file_vocal = audios_dir / f"{idx}_vocal.flac"
+                output_file_bgm = audios_dir / f"{idx}_bgm.flac"
 
-            print(f"[MODEL_SERVER] Saved to: {output_file}", flush=True)
+                audio_np = audio_result['mixed'].cpu().permute(1, 0).float().numpy()
+                sf.write(str(output_file), audio_np, sample_rate)
+
+                audio_np_vocal = audio_result['vocal'].cpu().permute(1, 0).float().numpy()
+                sf.write(str(output_file_vocal), audio_np_vocal, sample_rate)
+
+                audio_np_bgm = audio_result['bgm'].cpu().permute(1, 0).float().numpy()
+                sf.write(str(output_file_bgm), audio_np_bgm, sample_rate)
+
+                print(f"[MODEL_SERVER] Saved to: {output_file}, {output_file_vocal}, {output_file_bgm}", flush=True)
+            else:
+                # Single output mode (mixed, vocal, or bgm)
+                audio_np = audio_result.cpu().permute(1, 0).float().numpy()
+                output_file = audios_dir / f"{idx}.flac"
+                sf.write(str(output_file), audio_np, sample_rate)
+                print(f"[MODEL_SERVER] Saved to: {output_file}", flush=True)
+
             state.generating = False
 
             return {

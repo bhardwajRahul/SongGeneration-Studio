@@ -994,7 +994,7 @@ var App = () => {
                                 ) : generating && queue.length > 0 && (
                                     <LibraryItem item={{ title: 'Starting next song...', status: 'pending' }} isGenerating status="Please wait" elapsedTime={0} estimatedTime={0} />
                                 )}
-                                {library.filter(item => item.id !== currentGenId && !['generating', 'processing', 'pending'].includes(item.status)).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id).then(loadLibrary)} onPlay={audioPlayer.play} onUpdate={loadLibrary} isCurrentlyPlaying={audioPlayer.playingId === item.id} isAudioPlaying={audioPlayer.isPlaying} />)}
+                                {library.filter(item => item.id !== currentGenId && !['generating', 'processing', 'pending'].includes(item.status)).map(item => <LibraryItem key={item.id} item={item} onDelete={() => deleteGeneration(item.id).then(loadLibrary)} onPlay={audioPlayer.play} onUpdate={loadLibrary} isCurrentlyPlaying={audioPlayer.playingId === item.id} isAudioPlaying={audioPlayer.isPlaying} playingTrackIdx={audioPlayer.playingTrackIdx} />)}
                             </div>
                         )}
                     </div>
